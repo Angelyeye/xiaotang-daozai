@@ -1346,6 +1346,8 @@ impl App {
                         settings_card(ui,|ui|{
                             setting_row(ui,"电量","本机电量、充电状态与提醒；无电池设备自动隐藏",&mut self.settings.show_battery);
                             ui.separator();
+                            setting_row(ui,"天气","收起时显示天气图标和温度，点击打开天气页",&mut self.settings.show_weather);
+                            ui.separator();
                             setting_row(ui,"岛上歌词","收起时显示歌词，无歌词时显示封面和歌名",&mut self.settings.island_lyrics);
                         });
                         settings_label(ui,"功能页面");

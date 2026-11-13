@@ -820,10 +820,10 @@ impl App {
         }
     }
 
-    /// 常驻胶囊上的天气徽标：有快照、天气页可见且非极简时才占位。
+    /// 常驻天气开关开启、有快照、天气页可见且非极简时才占位。
     pub(crate) fn weather_pill(&self) -> Option<&crate::weather::Snapshot> {
         self.weather.snapshot.as_ref()
-            .filter(|_| self.module_on(WEATHER_PAGE) && !self.effective_minimal())
+            .filter(|_| self.settings.show_weather && self.module_on(WEATHER_PAGE) && !self.effective_minimal())
     }
 
     /// 温度文字比基础槽宽时需要补的宽度（负数会被调用方忽略）。
@@ -838,7 +838,7 @@ impl App {
         Some(chip - crate::bar_layout::WEATHER_WIDTH)
     }
 
-    /// 常驻胶囊的天气徽标：小图标 + 温度，紧跟时钟；点击进入天气页。
+    /// 常驻胶囊的天气徽标：小图标 + 温度；点击进入天气页。
     pub(crate) fn draw_pill_weather(&mut self, c: &Card, x: f32, layout: &crate::bar_layout::Layout) {
         let Some(snapshot) = self.weather_pill().cloned() else { return };
         self.paint_pill_weather(c, x, layout, &snapshot);

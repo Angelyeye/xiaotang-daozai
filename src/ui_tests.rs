@@ -5471,27 +5471,80 @@ fn shelf_remove_icon_stays_centered_on_hover_and_preserves_the_file(){
 
 #[test]
 fn resident_components_can_be_dragged_saved_and_reset(){
-    use crate::bar_layout::{CLOCK,BATTERY};
-    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());let mut h=H::new();
-    fn draw(h:&mut H,events:Vec<egui::Event>)->[Pos2;2]{
+    use crate::bar_layout::{CLOCK,BATTERY,WEATHER};
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    fn draw(h:&mut H,events:Vec<egui::Event>,slot:usize)->[Pos2;2]{
         let mut points=[Pos2::ZERO;2];
         h.t+=0.02;
-        let out=h.ctx.run(egui::RawInput{screen_rect:Some(Rect::from_min_size(Pos2::ZERO,egui::vec2(600.0,300.0))),time:Some(h.t),events,..Default::default()},|ctx|{egui::CentralPanel::default().show(ctx,|ui|{h.app.resident_order_settings(ui);for (index,slot) in [CLOCK,BATTERY].into_iter().enumerate(){points[index]=ui.ctx().read_response(ui.id().with(("resident-icon",slot))).unwrap().rect.center();}});});
+        let out=h.ctx.run(egui::RawInput{screen_rect:Some(Rect::from_min_size(Pos2::ZERO,egui::vec2(600.0,300.0))),time:Some(h.t),events,..Default::default()},|ctx|{egui::CentralPanel::default().show(ctx,|ui|{h.app.resident_order_settings(ui);for (index,slot) in [slot,BATTERY].into_iter().enumerate(){points[index]=ui.ctx().read_response(ui.id().with(("resident-icon",slot))).expect("暂未显示的组件也应可以独立拖动").rect.center();}});});
         h.shapes=out.shapes;points
     }
     fn point(h:&H,label:&str)->Pos2{h.shapes.iter().find_map(|s|match &s.shape{egui::Shape::Text(t) if t.galley.text()==label=>Some(t.visual_bounding_rect().center()),_=>None}).unwrap()}
-    draw(&mut h,vec![]);let [from,to]=draw(&mut h,vec![]);
+    for slot in [CLOCK,WEATHER] {
+    let mut h=H::new();
+    draw(&mut h,vec![],slot);let [from,to]=draw(&mut h,vec![],slot);
     let button=|pos,pressed|egui::Event::PointerButton{pos,button:egui::PointerButton::Primary,pressed,modifiers:Default::default()};
-    draw(&mut h,vec![egui::Event::PointerMoved(from),button(from,true)]);
-    draw(&mut h,vec![egui::Event::PointerMoved(from+egui::vec2(0.0,10.0))]);
-    draw(&mut h,vec![egui::Event::PointerMoved(to)]);
-    for _ in 0..3{draw(&mut h,vec![]);}
-    draw(&mut h,vec![button(to,false)]);
-    assert_eq!(h.app.settings.resident_order.first(),Some(&CLOCK));
+    draw(&mut h,vec![egui::Event::PointerMoved(from),button(from,true)],slot);
+    draw(&mut h,vec![egui::Event::PointerMoved(from+egui::vec2(0.0,10.0))],slot);
+    draw(&mut h,vec![egui::Event::PointerMoved(to)],slot);
+    for _ in 0..3{draw(&mut h,vec![],slot);}
+    draw(&mut h,vec![button(to,false)],slot);
+    assert_eq!(h.app.settings.resident_order.first(),Some(&slot));
     assert!(h.app.settings.resident_order.contains(&BATTERY));
     h.app.settings.save();assert_eq!(crate::model::Settings::load().resident_order,h.app.settings.resident_order);
-    let reset=point(&h,"恢复默认");draw(&mut h,vec![egui::Event::PointerMoved(reset),button(reset,true)]);draw(&mut h,vec![button(reset,false)]);
+    let reset=point(&h,"恢复默认");draw(&mut h,vec![egui::Event::PointerMoved(reset),button(reset,true)],slot);draw(&mut h,vec![button(reset,false)],slot);
     assert!(h.app.settings.resident_order.is_empty());
+    }
+}
+
+#[test]
+fn weather_resident_settings_preserve_old_orders_and_the_status_switch(){
+    use crate::bar_layout::{BATTERY,CLOCK,FOCUS,MUSIC,PET,QUOTA,WEATHER};
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());let mut h=H::new();
+    let path=crate::model::config_dir().join("settings.txt");std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path,"resident_order=7,6,2,0,9,1\nshow_weather=0\n").unwrap();
+    h.app.settings=crate::model::Settings::load();
+    assert_eq!(h.app.settings.resident_order,[FOCUS,MUSIC,QUOTA,CLOCK,WEATHER,PET,BATTERY],"旧排列应在时钟后插入天气并保留其余顺序");
+    h.app.weather.snapshot=Some(crate::weather::Snapshot{temp:9.0,..Default::default()});
+    assert!(h.app.weather_pill().is_none(),"状态开关关闭后天气不占常驻位置");
+    assert!(h.app.module_on(8),"关闭常驻天气应保留天气页面");
+    h.app.settings.save();h.app.settings=crate::model::Settings::load();
+    assert!(h.app.weather_pill().is_none(),"重启后应保留常驻天气开关");
+    for invalid in ["0,0,2,5,6,7,9","0,1,2,5,6,7,99","0,1,2","invalid",""] {
+        std::fs::write(&path,format!("resident_order={invalid}\n")).unwrap();
+        assert!(crate::model::Settings::load().resident_order.is_empty(),"无效排列应使用默认位置");
+    }
+}
+
+#[test]
+fn weather_status_switch_controls_the_badge_and_keeps_the_page_available(){
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    fn draw(h:&mut H,events:Vec<egui::Event>){
+        let output=std::sync::Arc::new(Mutex::new(None));let capture=output.clone();h.t+=0.02;let time=h.t;
+        egui::Context::set_immediate_viewport_renderer(move|ctx,mut viewport|{
+            let id=viewport.ids.this;
+            let raw=egui::RawInput{viewport_id:id,screen_rect:Some(Rect::from_min_size(Pos2::ZERO,egui::vec2(690.0,1000.0))),time:Some(time),events:events.clone(),viewports:std::iter::once((id,egui::ViewportInfo::default())).collect(),..Default::default()};
+            *capture.lock().unwrap()=Some(ctx.run(raw,|ctx|(viewport.viewport_ui_cb)(ctx)));
+        });
+        let _=h.ctx.run(Default::default(),|ctx|h.app.settings_ui(ctx,false));
+        h.shapes=output.lock().unwrap().take().unwrap().shapes;
+    }
+    for theme in [crate::settings_theme::SettingsTheme::Dark,crate::settings_theme::SettingsTheme::Light] {
+        let mut h=H::new();h.app.settings.settings_theme=theme;h.app.settings_tab=10;h.app.open_settings();h.ctx.set_embed_viewports(false);
+        h.app.weather.snapshot=Some(crate::weather::Snapshot{temp:9.0,..Default::default()});
+        for _ in 0..3 {draw(&mut h,vec![]);}
+        let text_rect=|h:&H,label:&str|h.shapes.iter().find_map(|s|match &s.shape{egui::Shape::Text(t) if t.galley.text()==label=>Some(t.visual_bounding_rect()),_=>None}).unwrap();
+        let heading=text_rect(&h,"状态组件");let bottom=text_rect(&h,"功能页面").top();
+        let title=h.shapes.iter().find_map(|s|match &s.shape{egui::Shape::Text(t) if t.galley.text()=="天气"&&t.pos.x>=heading.left()&&t.pos.y>heading.bottom()&&t.pos.y<bottom=>Some(t.visual_bounding_rect()),_=>None}).expect("状态组件应有独立的天气开关");
+        let point=h.shapes.iter().find_map(|s|match &s.shape{egui::Shape::Rect(r) if (r.rect.width()-34.0).abs()<0.01&&(r.rect.height()-20.0).abs()<0.01&&r.rect.center().y>title.top()&&r.rect.center().y<title.bottom()+24.0=>Some(r.rect.center()),_=>None}).unwrap();
+        for expected in [false,true] {
+            for pressed in [true,false] {draw(&mut h,vec![egui::Event::PointerMoved(point),egui::Event::PointerButton{pos:point,button:egui::PointerButton::Primary,pressed,modifiers:Default::default()}]);}
+            assert_eq!(h.app.weather_pill().is_some(),expected);
+            assert_eq!(h.app.side_items().contains(&crate::side_dock::SideItem::Weather),expected);
+            assert!(h.app.module_on(8),"关闭状态组件后天气页仍可使用");
+            h.app.settings=crate::model::Settings::load();assert_eq!(h.app.weather_pill().is_some(),expected,"天气开关应自动保存");
+        }
+    }
 }
 
 #[test]
@@ -6537,7 +6590,7 @@ fn deepseek_balance_gallery(){
 #[test]
 fn deepseek_compact_amount_fits_text_and_opens_account(){
     use crate::quota::{Provider,Event};
-    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());let mut h=H::new();h.quota_accounts(5);h.app.settings.pet=false;h.app.settings.resident_order=vec![1,9,2,0,6,7];
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());let mut h=H::new();h.quota_accounts(5);h.app.settings.pet=false;h.app.settings.resident_order=vec![1,9,2,0,5,6,7];
     let id=h.app.quota.config.connect_deepseek("preview".into(),"DeepSeek".into());let mut width:Option<f32>=None;let mut amount_rect=Rect::NOTHING;
     for (amount,label) in [("4.18","¥4.1"),("12800.00","¥1.28万"),("128000.00","¥12.8万")]{
         let snapshot=crate::quota::parse(Provider::DeepSeek,&serde_json::json!({"is_available":true,"balance_infos":[{"currency":"CNY","total_balance":amount,"topped_up_balance":amount,"granted_balance":"0.00"}]})).unwrap();h.app.quota_event(Event{id:id.clone(),result:Ok(snapshot)});
@@ -7928,7 +7981,7 @@ fn weather_resident_bar_preview(){
             image::save_buffer(dest.join("weather-bar.png"),&rgba,1280,380,image::ColorType::Rgba8).unwrap();
         }
     }
-    // 设置页「常驻排列」预览：天气徽标应跟随时钟一起出现。换一个 H，避免复用纹理缓存。
+    // 设置页「常驻排列」预览：天气徽标有独立位置。换一个 H，避免复用纹理缓存。
     let mut h=H::new();h.app.settings.pet=false;h.quota_accounts(1);
     h.app.weather.snapshot=Some(crate::weather::Snapshot{place:"杭州".into(),position:None,auto:false,temp:9.0,feels:Some(5.6),humidity:Some(58),wind:Some(13.9),code:51,day:true,high:Some(15.2),low:Some(6.8),sunrise:Some("06:52".into()),sunset:Some("17:21".into()),sun_times:None,days:vec![],at:chrono::Utc::now().timestamp()});
     let mut raster=crate::preview_raster::Raster::new(1200,300);
