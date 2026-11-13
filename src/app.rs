@@ -3063,20 +3063,21 @@ impl App {
                     let started=std::time::Instant::now();
                     let mut wait=std::time::Duration::from_millis(500);
                     let mut last:Option<((std::time::SystemTime,u64),std::time::Instant)>=None;
+                    let mut miss="未读取";
                     loop {
                         let print=lyrics::native_fingerprint(&source);
                         let unchanged=print.is_some_and(|print|last.is_some_and(|(seen,at)|seen==print && at.elapsed()<std::time::Duration::from_secs(15)));
                         let found=if unchanged {None}else{
                             if let Some(print)=print {last=Some((print,std::time::Instant::now()));}
-                            lyrics::read_native(&source,&title,&artist,dur)
+                            lyrics::read_native_detail(&source,&title,&artist,dur).map_err(|reason|miss=reason).ok()
                         };
                         let done=found.is_some();
                         match tx.try_send(found) {
-                            Ok(())=>{if done{break;}}
+                            Ok(())=>{if done{lyrics::log_native(&source,&title,&artist,"命中",started.elapsed());break;}}
                             Err(std::sync::mpsc::TrySendError::Disconnected(_))=>break,
                             Err(std::sync::mpsc::TrySendError::Full(_))=>{}
                         }
-                        if started.elapsed()>=std::time::Duration::from_secs(90){break;}
+                        if started.elapsed()>=std::time::Duration::from_secs(90){lyrics::log_native(&source,&title,&artist,&format!("放弃:{miss}"),started.elapsed());break;}
                         std::thread::sleep(wait);
                         wait=(wait*2).min(std::time::Duration::from_secs(5));
                     }

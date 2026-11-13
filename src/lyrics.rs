@@ -179,12 +179,25 @@ pub(crate) fn native_fingerprint(source:&str)->Option<(std::time::SystemTime,u64
 }
 
 pub(crate) fn read_native(source:&str,track:&str,artist:&str,duration:f64)->Option<Lyrics> {
-    if source.to_ascii_lowercase().contains("kugou") {return kugou_cache::read(track,artist,duration);}
+    read_native_detail(source,track,artist,duration).ok()
+}
+
+/// 本地缓存读取；未命中时给出原因，供诊断日志使用。
+pub(crate) fn read_native_detail(source:&str,track:&str,artist:&str,duration:f64)->Result<Lyrics,&'static str> {
+    if source.to_ascii_lowercase().contains("kugou") {return kugou_cache::read(track,artist,duration).ok_or("未命中");}
     if is_soda(source) {
-        let lyrics=parse_krc(&soda_cache::read(track,artist,duration)?);
-        return lyrics.synced.then_some(lyrics);
+        let lyrics=parse_krc(&soda_cache::read_detail(track,artist,duration).map_err(|miss|miss.label())?);
+        return if lyrics.synced {Ok(lyrics)}else{Err("缓存歌词无时间轴")};
     }
-    None
+    Err("不支持本地读取")
+}
+
+/// 后台本地轮询（客户端稍后才写好歌词）的结果单独记一行，命中或放弃时各写一次。
+pub(crate) fn log_native(source:&str,track:&str,artist:&str,outcome:&str,elapsed:std::time::Duration) {
+    if cfg!(test) {return;}
+    let line=format!("{} {source} · {track} - {artist} → 本地轮询:{outcome} 用时{}ms\n",
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),elapsed.as_millis());
+    crate::resources::append_log(&crate::model::config_dir().join("diagnostics"),"lyrics.log",&line);
 }
 
 /// 返回歌词及是否仍需等待酷狗缓存；等待期间复用已有歌词，不重复访问在线服务。
@@ -278,9 +291,13 @@ pub fn fetch_for_source(source:&str,track:&str,artist:&str,duration:f64,song_id:
         }
     }
     if is_soda(source) {
-        if let Some(raw)=soda_cache::read(track,artist,duration) {
-            let lyrics=parse_krc(&raw);
-            if lyrics.synced {return Ok(lyrics);}
+        match soda_cache::read_detail(track,artist,duration) {
+            Ok(raw)=>{
+                let lyrics=parse_krc(&raw);
+                if lyrics.synced {trace(||"汽水本地:命中".into());return Ok(lyrics);}
+                trace(||"汽水本地:无时间轴".into());
+            }
+            Err(miss)=>trace(||format!("汽水本地:{}",miss.label())),
         }
     }
     fetch(track,artist,duration)
