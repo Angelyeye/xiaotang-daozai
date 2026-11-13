@@ -251,7 +251,7 @@ impl Reader {
         let id=self.playback.media.song_id;
         if id.is_some() && (!self.playback.media.is_music() || self.playback.media.artist.is_empty() || self.playback.media.duration<=0.0 || self.playback.artwork_url.is_empty()) && (self.lookup.0!=id || now.saturating_sub(self.lookup.1)>=5000){
             let root=path.parent()?;
-            // 队列文件可达 8MB：同一首歌且文件没有变化时不重复解析（这首歌本来就没有封面时会一直满足上面的条件）。
+            // 大歌单的队列文件可达数十 MB：同一首歌且文件没有变化时不重复查找（这首歌本来就没有封面时会一直满足上面的条件）。
             let print=queue_fingerprint(root);
             if self.lookup.0!=id || self.queue_print!=print {
                 if let Some(metadata)=queue_track(root,id?){self.playback.metadata(metadata);self.queue_print=print;}
@@ -281,20 +281,59 @@ fn queue_fingerprint(root:&Path)->Vec<Option<(std::time::SystemTime,u64)>>{
     QUEUE_FILES.iter().map(|(file,_)|std::fs::metadata(root.join("webdata/file").join(file)).ok().and_then(|meta|Some((meta.modified().ok()?,meta.len())))).collect()
 }
 
+/// 队列文件只防异常：长期用户的「我喜欢」等大歌单可达上万首（约 2KB/首）。
+const QUEUE_LIMIT:u64=256*1024*1024;
+
 fn queue_track(root:&Path,id:u64)->Option<(NowPlaying,String)>{
     let mut partial=None;
     for (file,key) in QUEUE_FILES{
-        let Some(value)=(||{
+        let Some(found)=(||{
             let file=File::open(root.join("webdata/file").join(file)).ok()?;
-            if file.metadata().ok()?.len()>8*1024*1024{return None;}
-            serde_json::from_reader::<_,serde_json::Value>(file).ok()
+            if file.metadata().ok()?.len()>QUEUE_LIMIT{crate::resources::REJECTED_DATA.fetch_add(1,std::sync::atomic::Ordering::Relaxed);return None;}
+            find_in_queue(std::io::BufReader::new(file),key,id)
         })()else{continue;};
-        if let Some(found)=value.get(key).and_then(|v|v.as_array()).and_then(|list|list.iter().filter_map(track).find(|t|t.0.song_id==Some(id))){
-            if found.0.duration>0.0{return Some(found);}
-            if partial.is_none(){partial=Some(found);}
-        }
+        if found.0.duration>0.0{return Some(found);}
+        if partial.is_none(){partial=Some(found);}
     }
     partial
+}
+
+/// 在 `{"<key>":[歌曲, …]}` 中逐首解析，找到第一首 ID 匹配的歌即停止：
+/// 内存只保留一首歌（约 2KB），不再把整个队列解析成 JSON 树。
+fn find_in_queue<R:Read>(reader:R,key:&str,id:u64)->Option<(NowPlaying,String)>{
+    use serde::de::{Deserializer as _,DeserializeSeed,Error as _,IgnoredAny,MapAccess,SeqAccess,Visitor};
+    const FOUND:&str="daozai:found";
+    struct List<'a>{id:u64,found:&'a mut Option<(NowPlaying,String)>}
+    impl<'de> DeserializeSeed<'de> for List<'_> {
+        type Value=();
+        fn deserialize<D:serde::Deserializer<'de>>(self,deserializer:D)->Result<(),D::Error>{deserializer.deserialize_seq(self)}
+    }
+    impl<'de> Visitor<'de> for List<'_> {
+        type Value=();
+        fn expecting(&self,f:&mut std::fmt::Formatter)->std::fmt::Result{f.write_str("歌曲数组")}
+        fn visit_seq<A:SeqAccess<'de>>(self,mut seq:A)->Result<(),A::Error>{
+            while let Some(value)=seq.next_element::<serde_json::Value>()? {
+                if let Some(hit)=track(&value).filter(|t|t.0.song_id==Some(self.id)){*self.found=Some(hit);return Err(A::Error::custom(FOUND));}
+            }
+            Ok(())
+        }
+    }
+    struct Root<'a>{key:&'a str,id:u64,found:&'a mut Option<(NowPlaying,String)>}
+    impl<'de> Visitor<'de> for Root<'_> {
+        type Value=();
+        fn expecting(&self,f:&mut std::fmt::Formatter)->std::fmt::Result{f.write_str("队列对象")}
+        fn visit_map<A:MapAccess<'de>>(self,mut map:A)->Result<(),A::Error>{
+            while let Some(name)=map.next_key::<String>()? {
+                if name==self.key {map.next_value_seed(List{id:self.id,found:&mut *self.found})?;}
+                else {map.next_value::<IgnoredAny>()?;}
+            }
+            Ok(())
+        }
+    }
+    let mut found=None;
+    // 找到后以约定错误提前结束解析；其余错误（格式不符、写入中途截断）按未找到处理。
+    let _=serde_json::Deserializer::from_reader(reader).deserialize_map(Root{key,id,found:&mut found});
+    found
 }
 
 fn process_id()->Option<u32>{
@@ -536,6 +575,55 @@ mod tests{
         let mut reader=Reader::default();let media=reader.read(&files.path,Some(9),2000).unwrap();
         assert_eq!(media.duration,240.0);assert_eq!(media.artist,"已有歌手");assert_eq!(media.album,"已有专辑");
         assert_eq!(reader.playback.artwork_url,"https://p1.music.126.net/test.jpg?param=256y256");
+    }
+    /// 旧读法：整份解析后取第一首 ID 匹配的歌，用于新旧结果对比。
+    fn whole_file(raw:&[u8],key:&str,id:u64)->Option<(NowPlaying,String)>{
+        let value:serde_json::Value=serde_json::from_slice(raw).ok()?;
+        value.get(key)?.as_array()?.iter().filter_map(track).find(|t|t.0.song_id==Some(id))
+    }
+    fn same(a:&Option<(NowPlaying,String)>,b:&Option<(NowPlaying,String)>)->bool{
+        match (a,b) {
+            (None,None)=>true,
+            (Some(a),Some(b))=>a.1==b.1 && (&a.0.title,&a.0.artist,&a.0.album,a.0.song_id,a.0.duration)==(&b.0.title,&b.0.artist,&b.0.album,b.0.song_id,b.0.duration),
+            _=>false,
+        }
+    }
+    #[test]
+    fn large_queue_is_searched_song_by_song_with_the_same_result(){
+        // 5000 首、约 2.2KB/首（与本机实测相近）：超过原先 8MB 整份解析的上限。
+        let pad="填".repeat(700);
+        let tracks:Vec<_>=(1..=5000u64).map(|id|serde_json::json!({"track":{"id":id,"name":format!("歌{id}"),"artists":[{"name":"歌手"}],
+            "album":{"name":"专辑","picUrl":"https://p1.music.126.net/a.jpg"},"duration":200000+id,"extra":pad}})).collect();
+        let raw=serde_json::json!({"before":{"skip":[1,2,3]},"list":tracks,"after":"x"}).to_string().into_bytes();
+        assert!(raw.len()>8*1024*1024,"测试队列应超过旧上限：{}",raw.len());
+        for id in [1,2500,5000] {
+            let found=find_in_queue(raw.as_slice(),"list",id);
+            assert_eq!(found.as_ref().map(|t|t.0.duration),Some((200000+id) as f64/1000.0));
+            assert!(same(&found,&whole_file(&raw,"list",id)),"第 {id} 首新旧结果不一致");
+        }
+        assert!(find_in_queue(raw.as_slice(),"list",5001).is_none());
+        assert!(find_in_queue(raw.as_slice(),"queue",1).is_none(),"只在指定的键下查找");
+        // 同一 ID 出现两次时取第一首，与旧读法一致。
+        let dup=serde_json::json!({"list":[{"id":7,"name":"第一首"},{"id":7,"name":"第二首","duration":1000}]}).to_string();
+        assert_eq!(find_in_queue(dup.as_bytes(),"list",7).unwrap().0.title,"第一首");
+        // 客户端写入到一半：目标歌曲已完整写出时可用，未写完时不使用残缺数据。
+        let cut=&raw[..raw.len()/2];
+        assert_eq!(find_in_queue(cut,"list",1).unwrap().0.song_id,Some(1));
+        assert!(find_in_queue(cut,"list",5000).is_none());
+        for bad in [&b"[]"[..],b"{\"list\":{}}",b"{\"list\":[1,\"x\",null]}",b""] {assert!(find_in_queue(bad,"list",1).is_none());}
+    }
+    #[test]
+    #[ignore="只读对比本机网易云播放队列：逐首对比整份解析与逐首查找的结果"]
+    fn live_queue_search_matches_whole_file_parse(){
+        let root=std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap()).join("NetEase/CloudMusic/webdata/file");
+        let mut count=0;
+        for (name,key) in QUEUE_FILES {
+            let Ok(raw)=std::fs::read(root.join(name)) else{continue;};
+            let value:serde_json::Value=serde_json::from_slice(&raw).unwrap();
+            let ids:Vec<u64>=value[key].as_array().map(|list|list.iter().filter_map(track).filter_map(|t|t.0.song_id).collect()).unwrap_or_default();
+            for id in ids {assert!(same(&find_in_queue(raw.as_slice(),key,id),&whole_file(&raw,key,id)),"{name} 中 ID {id} 不一致");count+=1;}
+        }
+        assert!(count>0);println!("网易云队列：{count} 首歌两种读法结果一致");
     }
     #[test]
     #[ignore="需要本机网易云正在播放，用于验证无 SMTC 的原生数据和歌词"]
