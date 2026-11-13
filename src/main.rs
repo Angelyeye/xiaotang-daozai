@@ -563,6 +563,18 @@ impl eframe::App for Shell {
 
         #[cfg(windows)]
         if let Some(native) = &mut self.native {
+            // 兼容渲染：读回的画面交给分层窗口，边缘保留抗锯齿。画面变化（或有其他输入）时才请求下一次读回，
+            // 读回完成本身触发的那一帧若画面没变就停下，静止时不会一直空转。
+            if native.wants_frames() {
+                let (shot,other_input)=ctx.input(|i|(
+                    i.events.iter().rev().find_map(|e|match e{egui::Event::Screenshot{image,..}=>Some(image.clone()),_=>None}),
+                    i.events.iter().any(|e|!matches!(e,egui::Event::Screenshot{..})),
+                ));
+                let changed=shot.as_ref().is_some_and(|image|native.present_frame(image.size,image.as_raw()));
+                if shot.is_none() || changed || other_input {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
+                }
+            }
             let r = |r: egui::Rect| (r.left(), r.top(), r.width(), r.height());
             // 保留主窗口的事件循环，避免全屏隐藏后设置窗口无法关闭或重新打开。
             let region=if self.hidden {(0.0,0.0,0.0,0.0)} else {r(out.region)};

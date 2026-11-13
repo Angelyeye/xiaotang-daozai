@@ -328,8 +328,20 @@ fn surface_needs_outline_clip(backend:Option<eframe::wgpu::Backend>,vendor:&str,
     })
 }
 
+/// 兼容后端的分层窗口状态：先按轮廓裁剪，读回到带透明的画面后再切到分层窗口。
+#[derive(Default)]
+enum Layering {
+    /// 不需要（透明合成正常）或还没收到第一帧。
+    #[default]
+    Pending,
+    Active(crate::layered::Layered),
+    /// 读不到 alpha 或系统拒绝：一直用轮廓裁剪。
+    Unavailable,
+}
+
 pub struct Window {
     hwnd: HWND,
+    layering: Layering,
     region: (i32, i32, i32, i32),
     expanded: bool,
     hook: HWINEVENTHOOK,
@@ -373,7 +385,7 @@ impl Window {
         let opaque_surface=surface_needs_outline_clip(backend,&vendor,&renderer);
         if opaque_surface{glass_diagnostic("渲染兼容：已启用岛体轮廓裁剪，避免透明画布出现黑块");}
         watch_drag(hwnd,cc.egui_ctx.clone());
-        Some(Self { hwnd, region: (i32::MIN, 0, 0, 0), expanded: false, hook, browser_state:(None,PollClock::default()), drag_capture:DragCapture::default(), glass:None, backdrop:None, blur:false, blur_unavailable:false, opaque_surface })
+        Some(Self { hwnd, layering:Layering::Pending, region: (i32::MIN, 0, 0, 0), expanded: false, hook, browser_state:(None,PollClock::default()), drag_capture:DragCapture::default(), glass:None, backdrop:None, blur:false, blur_unavailable:false, opaque_surface })
     }
 
     /// 使用目标屏幕的物理坐标定位，并在缩放、岛体大小、水平位置或屏幕连接变化后重新校正。
@@ -402,6 +414,43 @@ impl Window {
     /// 系统背景模糊是否正在生效（毛玻璃皮肤据此选择着色深浅）。
     pub fn blur_active(&self)->bool {self.blur}
     pub fn opaque_surface(&self)->bool {self.opaque_surface}
+
+    /// 是否需要每帧读回画面交给分层窗口（兼容后端，且分层窗口仍可用）。
+    pub fn wants_frames(&self)->bool {self.opaque_surface && !matches!(self.layering,Layering::Unavailable)}
+
+    /// 交一帧读回的画面（RGBA，已预乘）。返回画面是否变化；首帧确认确有透明像素后才切换。
+    pub fn present_frame(&mut self,size:[usize;2],rgba:&[u8])->bool {
+        if !self.wants_frames(){return false;}
+        if matches!(self.layering,Layering::Pending) {
+            if !crate::layered::has_real_alpha(size,rgba) {
+                glass_diagnostic("渲染兼容：读回的画面没有透明通道，继续使用轮廓裁剪");
+                self.layering=Layering::Unavailable;
+                return false;
+            }
+            match crate::layered::Layered::new() {
+                Ok(layered)=>{
+                    glass_diagnostic("渲染兼容：已切换为分层窗口逐像素透明（边缘抗锯齿）");
+                    self.layering=Layering::Active(layered);
+                }
+                Err(error)=>{
+                    glass_diagnostic(&format!("渲染兼容：分层显示窗口创建失败：{error:?}"));
+                    self.layering=Layering::Unavailable;return false;
+                }
+            }
+        }
+        let Layering::Active(layered)=&mut self.layering else {return false};
+        match layered.present(self.hwnd,size,rgba) {
+            // 切到分层窗口后，下一次 update 换回矩形区域（岛仔窗口本身已几乎不可见，只负责命中）。
+            Ok(changed)=>changed,
+            Err(error)=>{
+                glass_diagnostic(&format!("渲染兼容：分层窗口不可用，回到轮廓裁剪：{error:?}"));
+                layered.detach(self.hwnd);
+                self.layering=Layering::Unavailable;
+                self.glass=None;self.region=(i32::MIN,0,0,0);
+                false
+            }
+        }
+    }
 
     pub fn logical_origin(&self,scale:f32)->Option<eframe::egui::Pos2>{
         let mut r=RECT::default();
@@ -481,7 +530,8 @@ impl Window {
             }
         }
         // 不可靠的透明合成路径按真实轮廓裁剪，避免圆角外侧和透明画布留下黑底。
-        match glass.filter(|_|self.opaque_surface) {
+        let outline_clip=self.opaque_surface && !matches!(self.layering,Layering::Active(_));
+        match glass.filter(|_|outline_clip) {
             Some(shapes) => {
                 let key=glass_key(shapes,ppp);
                 if self.glass.as_ref()!=Some(&key) {
@@ -511,7 +561,9 @@ impl Window {
             }
             None => {}
         }
-        unsafe { apply_style(self.hwnd, editing, expanded && !self.expanded) };
+        let raise=expanded && !self.expanded;
+        unsafe { apply_style(self.hwnd, editing, raise) };
+        if let Layering::Active(layered)=&mut self.layering {layered.sync(self.hwnd,raise);}
         self.expanded = expanded;
     }
 }
@@ -546,7 +598,7 @@ mod tests {
             let hwnd=CreateWindowExW(WS_EX_TOOLWINDOW,windows::core::w!("STATIC"),windows::core::w!(""),WS_POPUP,-10000,-10000,px(400.0),px(200.0),None,None,None,None).unwrap();
             let saved=hit().lock().unwrap_or_else(|e|e.into_inner()).clone();
             {
-                let mut native=Window{hwnd,region:(0,0,0,0),expanded:false,hook:HWINEVENTHOOK::default(),browser_state:(None,PollClock::now()),drag_capture:DragCapture::default(),glass:None,backdrop:None,blur:false,blur_unavailable,opaque_surface:surface_needs_outline_clip(backend,vendor,renderer)};
+                let mut native=Window{hwnd,layering:Layering::Pending,region:(0,0,0,0),expanded:false,hook:HWINEVENTHOOK::default(),browser_state:(None,PollClock::now()),drag_capture:DragCapture::default(),glass:None,backdrop:None,blur:false,blur_unavailable,opaque_surface:surface_needs_outline_clip(backend,vendor,renderer)};
                 let shapes=[crate::app::GlassShape::Round(eframe::egui::Rect::from_min_max(eframe::egui::pos2(80.0,60.0),eframe::egui::pos2(320.0,160.0)),25.0)];
                 native.update((0.0,0.0,400.0,200.0),(80.0,60.0,240.0,100.0),None,None,Some(&shapes),ppp,false,false);
                 let region=CreateRectRgn(0,0,0,0);
@@ -650,7 +702,7 @@ mod tests {
             assert!(above(cover.0,island.0),"先复现其他窗口盖住岛体");
             let foreground=GetForegroundWindow();
             let saved=hit().lock().unwrap_or_else(|e|e.into_inner()).clone();
-            let mut native=Window{hwnd:island.0,region:(0,0,0,0),expanded:false,hook:HWINEVENTHOOK::default(),browser_state:(None,PollClock::now()),drag_capture:DragCapture::default(),glass:None,backdrop:None,blur:false,blur_unavailable:false,opaque_surface:false};
+            let mut native=Window{hwnd:island.0,layering:Layering::Pending,region:(0,0,0,0),expanded:false,hook:HWINEVENTHOOK::default(),browser_state:(None,PollClock::now()),drag_capture:DragCapture::default(),glass:None,backdrop:None,blur:false,blur_unavailable:false,opaque_surface:false};
             let update=|native:&mut Window,expanded|native.update((0.0,0.0,416.0,140.0),(0.0,0.0,416.0,140.0),None,None,None,1.0,false,expanded);
             update(&mut native,true);
             assert!(above(island.0,cover.0),"展开时必须重新抬高实际窗口层级，不能只检查置顶标记");
