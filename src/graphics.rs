@@ -10,8 +10,19 @@ fn compatible(mut options:eframe::NativeOptions,backends:eframe::wgpu::Backends)
     if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup)=&mut options.wgpu_options.wgpu_setup {
         setup.instance_descriptor.backends=backends;
         setup.power_preference=eframe::wgpu::PowerPreference::LowPower;
+        // 默认的 Performance 让 DX12 分配器按 256MB 显存块 + 64MB 上传块预留。核显没有独立显存，
+        // 这些都算进岛仔进程内存（实测 60MB → 530MB）。岛仔的纹理只有几 MB，按小块分配即可。
+        let base=setup.device_descriptor.clone();
+        setup.device_descriptor=std::sync::Arc::new(move|adapter|small_memory_blocks(base(adapter)));
     }
     options
+}
+/// 岛仔同时存在的纹理只有几十张。DX12 会按绑定上限预建整张描述符表：
+/// 默认 100 万项约 61MB，65536 项约 4MB，仍有上千倍余量。
+const MAX_BINDINGS:u32=65_536;
+fn small_memory_blocks(descriptor:eframe::wgpu::DeviceDescriptor<'static>)->eframe::wgpu::DeviceDescriptor<'static>{
+    let required_limits=eframe::wgpu::Limits{max_non_sampler_bindings:MAX_BINDINGS,..descriptor.required_limits.clone()};
+    eframe::wgpu::DeviceDescriptor{memory_hints:eframe::wgpu::MemoryHints::MemoryUsage,required_limits,..descriptor}
 }
 
 /// 兼容渲染优先用 Direct3D 12（Windows 原生、睡眠唤醒与换屏处理最稳）；
@@ -80,6 +91,15 @@ mod tests {
         });
         assert!(result.is_ok());
         assert_eq!(backends,[eframe::wgpu::Backends::DX12,eframe::wgpu::Backends::VULKAN],"先 Direct3D 12，失败再 Vulkan");
+    }
+
+    #[test]
+    fn compatible_rendering_uses_small_gpu_memory_blocks(){
+        let base=eframe::wgpu::DeviceDescriptor{label:Some("egui wgpu device"),required_limits:eframe::wgpu::Limits{max_texture_dimension_2d:8192,..Default::default()},..Default::default()};
+        let descriptor=small_memory_blocks(base);
+        assert!(matches!(descriptor.memory_hints,eframe::wgpu::MemoryHints::MemoryUsage),"核显上默认分块会让进程多占约 300MB");
+        assert_eq!(descriptor.required_limits.max_texture_dimension_2d,8192,"保留 egui 的其他设备要求");
+        assert_eq!(descriptor.required_limits.max_non_sampler_bindings,MAX_BINDINGS,"默认 100 万项的描述符表会多占约 61MB");
     }
 
     #[test]
