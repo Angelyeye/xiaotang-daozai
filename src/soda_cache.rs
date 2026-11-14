@@ -167,9 +167,20 @@ fn read_detail_at(path:&std::path::Path,title:&str,artist:&str,duration:f64)->Re
     let headers=data.get(..size*2).ok_or(Miss::Format)?.to_vec();
     let changed=||data.get(..headers.len())!=Some(&headers[..]);
     let Some(entries)=entries(data) else {return Err(if changed(){Miss::Busy}else{Miss::Format});};
-    let found=entries.into_iter().find_map(|entry|select(&decode(entry)?,title,artist,duration));
+    // 解码是主要开销（约 0.25ms/条）：原始字节里连歌名片段都没有的记录直接跳过。
+    let needle=title_needle(title);
+    let found=entries.into_iter().filter(|entry|needle.as_ref().is_none_or(|needle|needle.is_match(entry)))
+        .find_map(|entry|select(&decode(entry)?,title,artist,duration));
     if changed(){return Err(Miss::Busy);}
     found.ok_or(Miss::NoMatch)
+}
+
+/// 歌名里最长的一段连续字母数字（不区分大小写）：汽水在缓存记录和系统媒体信息里写的是同一个歌名，
+/// MessagePack 中字符串按原样 UTF-8 存储，可直接在记录字节里查找。太短的片段不做预筛，避免误判。
+fn title_needle(title:&str)->Option<regex::bytes::Regex>{
+    let run=title.split(|c:char|!c.is_alphanumeric()).max_by_key(|run|run.chars().count())?;
+    if run.chars().count()<2 {return None;}
+    regex::bytes::RegexBuilder::new(&regex::escape(run)).case_insensitive(true).build().ok()
 }
 
 #[cfg(test)]
@@ -269,6 +280,28 @@ mod tests {
         assert_eq!(read_detail_at(&path,"歌","歌手",120.0),Err(Miss::Format));
         std::fs::remove_file(&path).unwrap();
         assert_eq!(read_detail_at(&path,"歌","歌手",120.0),Err(Miss::Missing));
+    }
+    #[test]
+    fn title_needle_prefilters_by_the_longest_alphanumeric_run(){
+        let needle=title_needle("江南-林俊杰(JJ Lin)（Cover 林俊杰）").unwrap();
+        assert!(needle.is_match("…江南-林俊杰(JJ Lin)（Cover 林俊杰）…".as_bytes()));
+        let needle=title_needle("Fever Pitch").unwrap();
+        assert!(needle.is_match(b"name\xdb\x00\x00\x00\x0bFEVER PITCH"),"拉丁字母不区分大小写");
+        assert!(!needle.is_match(b"other song"));
+        assert!(title_needle("A").is_none() && title_needle("…").is_none(),"太短的片段不预筛");
+    }
+    #[test]
+    #[ignore="性能测量：在 release 下运行，SODA_DB 指定缓存文件（默认本机汽水缓存）；测最坏情况（找不到、遍历到底）的单次读取耗时"]
+    fn live_worst_case_read_cost(){
+        let path=std::env::var_os("SODA_DB").filter(|path|!path.is_empty()).map(std::path::PathBuf::from)
+            .unwrap_or_else(||std::path::PathBuf::from(std::env::var_os("APPDATA").unwrap()).join("SodaMusic/LunaCacheV2/entries.db"));
+        let data=std::fs::read(&path).unwrap();
+        let records=entries(&data).unwrap().len();
+        let rounds=20;let started=std::time::Instant::now();
+        for _ in 0..rounds {assert_eq!(read_detail_at(&path,"不存在的歌曲","不存在的歌手",120.0),Err(Miss::NoMatch));}
+        let each=started.elapsed()/rounds;
+        let mb=data.len() as f64/1024.0/1024.0;
+        println!("汽水缓存 {mb:.2} MB、{records} 条记录：最坏情况单次读取 {each:?}，约 {:.1} ms/MB",each.as_secs_f64()*1000.0/mb);
     }
     #[test]
     #[ignore="只读对比本机汽水缓存：整份读取与内存映射（撑大到 40MB 的副本）逐条结果一致，不输出歌词正文"]
