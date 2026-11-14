@@ -16,7 +16,8 @@ function Save-Text([string]$Name, [string]$Value) {
 New-Item -ItemType Directory -Path $collectionRoot | Out-Null
 try {
     $logs = @('last-error.log', 'last-graphics.log', 'last-startup.log', 'resources.log',
-        'resources.previous.log', 'last-resource-anomaly.log', 'resource-guard.log')
+        'resources.previous.log', 'last-resource-anomaly.log', 'resource-guard.log',
+        'weather-network.log', 'weather-network.previous.log')
     foreach ($name in $logs + @('glass-diagnostics.txt')) {
         $source = if ($name -eq 'glass-diagnostics.txt') { Join-Path $DataDirectory $name } else { Join-Path (Join-Path $DataDirectory 'diagnostics') $name }
         if (!(Test-Path -LiteralPath $source -PathType Leaf)) { $missing.Add($name); continue }

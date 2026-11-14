@@ -1221,7 +1221,7 @@ const SETTINGS_GROUPS: [(&str,usize,usize);9] = [
 
 impl App {
     pub fn settings_ui(&mut self,ctx:&egui::Context,autostart:bool){
-        if !self.settings_open{self.window_layout().close();release_support_codes(ctx);}
+        if !self.settings_open{self.window_layout().close();release_support_codes(ctx);self.weather_source.close();}
         self.updates.poll(ctx);
         self.updates.dialog_ui(ctx);
         if !self.settings_open{return;}
@@ -2009,7 +2009,7 @@ impl App {
             if before!=format!("{:?}",self.settings){self.settings.save();}
             ctx.set_style(original_style);
         });
-        if !self.settings_open{self.window_layout().close();}
+        if !self.settings_open{self.window_layout().close();self.weather_source.close();}else{self.weather_tutorial_ui(ctx);}
     }
 }
 

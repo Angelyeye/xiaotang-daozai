@@ -824,6 +824,7 @@ pub struct App {
     pub(crate) quota: crate::quota_ui::State,
     /// 天气页的当前数据与后台拉取状态。
     pub(crate) weather: crate::weather::State,
+    pub(crate) weather_source: crate::weather_source_ui::State,
     pub(crate) updates: crate::updates::State,
     pub(crate) resident: bar::Motion,
     pub(crate) resident_power: (Option<u8>,bool),
@@ -846,7 +847,9 @@ impl App {
         let focus_seconds=settings.focus_minutes as f32*60.0;
         let initial_lyrics=settings.lyrics_enabled;
         let initial_page=settings.page_order.iter().copied().find(|page|settings.visible_pages[*page]).unwrap_or(0);
-        let weather=crate::weather::State::load(&settings.weather_city,settings.weather_position.as_ref());
+        let weather_source=crate::weather_source_ui::State::load();
+        let mut weather=crate::weather::State::load(&settings.weather_city,settings.weather_position.as_ref());
+        if weather_source.displayed==crate::weather_source_ui::Provider::Qweather {weather.snapshot=weather_source.runtime.snapshot();}
         Self {
             opts,
             render_compat_running: settings.render_compat,
@@ -949,6 +952,7 @@ impl App {
             calendar: CalendarState::load(),
             quota: crate::quota_ui::State::load(),
             weather,
+            weather_source,
             updates: Default::default(),
             resident: Default::default(), resident_power:(None,false),
         }

@@ -39,6 +39,8 @@ pub mod quota;
 mod quota_ui;
 pub mod weather;
 mod weather_ui;
+mod weather_source_ui;
+mod qweather;
 mod pages;
 mod extras;
 mod pet;
