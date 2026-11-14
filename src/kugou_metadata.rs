@@ -257,11 +257,14 @@ mod tests {
     /// 与 `Cache::get` 相同的续扫方式：一轮结束后下一轮从停下的位置接着扫。
     /// 返回（结果与命中区块、是否绕回过开头、切片数）。
     fn search(filename:&str,start:usize,slice:Duration)->(Option<((String,f64),usize)>,bool,usize){
-        let (pid,exe)=own_process();let (mut cursor,mut wrapped,mut slices)=(start,false,0);
+        let (pid,exe)=own_process();search_in(pid,&exe,filename,start,slice)
+    }
+    fn search_in(pid:u32,exe:&str,filename:&str,start:usize,slice:Duration)->(Option<((String,f64),usize)>,bool,usize){
+        let (mut cursor,mut wrapped,mut slices)=(start,false,0);
         for _ in 0..20 {
             let mut state=Scan::from(cursor);
             loop {
-                match read_slice_in(pid,&exe,filename,&mut state,slice) {
+                match read_slice_in(pid,exe,filename,&mut state,slice) {
                     Step::Found(value,base)=>return (Some((value,base)),wrapped||state.wrapped,slices),
                     Step::Pending=>slices+=1,
                     Step::Done=>{wrapped|=state.wrapped;cursor=state.cursor;break;}
@@ -298,6 +301,49 @@ mod tests {
         assert!(started.elapsed()<ATTEMPT+SLICE*2,"一轮不超过预算：{:?}",started.elapsed());
         // 不是酷狗进程：直接结束，不申请读取权限。
         assert!(matches!(read_slice(pid,"测试歌手 - 不存在",&mut Scan::from(0),SLICE),Step::Done));
+    }
+    /// 正在播放的酷狗：主窗口标题形如「歌手 - 歌名 - 酷狗音乐」。
+    fn kugou_now()->Option<(u32,String)>{
+        struct Found(Option<(u32,String)>);
+        unsafe extern "system" fn visit(window:Handle,param:isize)->i32{
+            let found=&mut *(param as *mut Found);
+            let mut text=[0u16;1024];let len=GetWindowTextW(window,text.as_mut_ptr(),1024);if len<=0{return 1;}
+            let text=String::from_utf16_lossy(&text[..len as usize]);
+            let Some(filename)=text.trim().strip_suffix(" - 酷狗音乐") else{return 1;};
+            if !filename.contains(" - "){return 1;}
+            let mut pid=0;GetWindowThreadProcessId(window,&mut pid);
+            if !super::super::player_process::image_is(pid,"KuGou.exe"){return 1;}
+            found.0=Some((pid,filename.to_owned()));0
+        }
+        let mut found=Found(None);unsafe{EnumWindows(visit,&mut found as *mut Found as isize);}found.0
+    }
+    #[test]
+    #[ignore="需要本机酷狗正在播放：只读扫描真实酷狗内存，强制从命中位置之后开始，验证绕回开头和跨轮续扫"]
+    fn live_kugou_forced_wraparound_finds_the_same_duration(){
+        let (pid,filename)=kugou_now().expect("未找到正在播放的酷狗窗口");
+        let started=Instant::now();
+        let (baseline,_,_)=search_in(pid,"KuGou.exe",&filename,0,SLICE);
+        let (value,mut base)=baseline.expect("从头扫描应能找到当前歌曲");
+        println!("当前歌曲：{filename}，曲长 {} 秒；从头扫描命中，用时 {:?}",value.1,started.elapsed());
+        let process=Process(unsafe{OpenProcess(0x410,0,pid)});assert!(!process.0.is_null());
+        // 从命中区块之后开始扫：数据在起点之下，只能扫到地址空间末尾、绕回开头才能找到。
+        // 内存里可能有多份副本：命中的若仍在起点之上，就把起点挪到它之后再试。
+        for attempt in 1..=20 {
+            let mut region=Region::default();
+            assert!(unsafe{VirtualQueryEx(process.0,base,&mut region,std::mem::size_of::<Region>())}!=0);
+            let after=region.base+region.size;let started=Instant::now();
+            let (forced,wrapped,slices)=search_in(pid,"KuGou.exe",&filename,after,SLICE);
+            let (forced_value,forced_base)=forced.expect("强制从高地址开始后应能找到");
+            assert_eq!(kugou_now().map(|(_,f)|f).as_deref(),Some(filename.as_str()),"测试期间切歌了，请重跑");
+            assert_eq!(forced_value,value,"绕回后找到的曲长应与从头扫描一致");
+            if wrapped {
+                println!("第 {attempt} 次：起点 {after:#x}，绕回开头后在 {forced_base:#x} 命中，{} 片、用时 {:?}",slices+1,started.elapsed());
+                return;
+            }
+            println!("第 {attempt} 次：起点之上还有副本（{forced_base:#x}），继续把起点后移");
+            base=forced_base;
+        }
+        panic!("连续 20 次都在起点之上找到副本，未能验证绕回");
     }
     #[test]
     fn exact_track_duration_rejects_other_versions_and_invalid_values(){
