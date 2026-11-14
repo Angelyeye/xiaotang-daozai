@@ -83,6 +83,12 @@ impl Layout {
     }
     pub fn balance_tail(&mut self,position:usize,extra:f32){self.widen(quota_slot(position),extra);}
     pub fn widen_clock(&mut self, extra:f32) {self.widen(CLOCK,extra);}
+    pub fn hide_clock(&mut self) {
+        let Some(center)=self.x[CLOCK].take() else{return;};
+        let removed=self.widths[CLOCK]+12.0;
+        self.width=(self.width-removed).max(96.0);
+        for x in self.x.iter_mut().flatten() {*x+=if *x<center {removed/2.0}else{-removed/2.0};}
+    }
     pub fn reorder(&mut self,order:&[usize]) {
         if !valid_order(order){return;}
         let original=self.x.clone();let mut cursor=-self.width/2.0+16.0;
@@ -141,6 +147,23 @@ impl Motion {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn hidden_clock_closes_its_gap_in_custom_orders(){
+        for reverse in [false,true] {for count in [0,5] {
+            let mut order=DEFAULT_ORDER.to_vec();if reverse {order.reverse();}
+            let mut layout=Layout::new(true,count,true,true,false,true,true);
+            layout.reorder(&order);layout.widen_clock(64.0);
+            let width=layout.width;let removed=layout.widths[CLOCK]+12.0;
+            layout.hide_clock();assert!(layout.x[CLOCK].is_none());
+            assert_eq!(layout.width,(width-removed).max(96.0));
+            let mut boxes:Vec<_>=layout.x.iter().enumerate().filter_map(|(i,x)|x.map(|x|(x-layout.widths[i]/2.0,x+layout.widths[i]/2.0))).collect();
+            boxes.sort_by(|a,b|a.0.total_cmp(&b.0));
+            assert!(boxes.windows(2).all(|p|p[1].0-p[0].1>=6.9),"关闭时间后相邻组件不应重叠");
+            let after=layout.x.clone();layout.hide_clock();assert_eq!(layout.x,after);
+        }}
+        let mut empty=Layout::new(false,0,false,false,false,false,false);
+        empty.hide_clock();assert_eq!(empty.width,96.0);assert!(empty.x.iter().all(Option::is_none));
+    }
     #[test]
     fn weather_can_be_reordered_independently_of_the_clock(){
         let order=[WEATHER,FOCUS,MUSIC,QUOTA,CLOCK,PET,BATTERY];

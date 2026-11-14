@@ -6129,6 +6129,69 @@ fn clock_seconds_formats_and_persists(){
 }
 
 #[test]
+fn clock_residency_only_hides_the_collapsed_clock(){
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    for (seconds,twelve,period) in [(false,false,0),(true,false,0),(true,true,2)] {
+        let mut h=H::new();h.app.settings.pet=false;h.power=(Some(76),false);h.quota_accounts(2);
+        h.app.settings.clock_seconds=seconds;h.app.settings.clock_12h=twelve;h.app.settings.clock_period=period;
+        h.app.weather.snapshot=Some(crate::weather::Snapshot{temp:19.0,..Default::default()});
+        let digits=if seconds {if twelve{"9:41:00"}else{"09:41:00"}}else{"09:41"};
+        let visible=|h:&H|h.shapes.iter().any(|s|matches!(&s.shape,egui::Shape::Text(t)if t.galley.text()==digits));
+        for _ in 0..90{h.frame(vec![]);}assert!(visible(&h));let width=h.app.resident.target.width;
+        h.app.settings.show_clock=false;
+        for _ in 0..90{h.frame(vec![]);}
+        assert!(!visible(&h));assert!(h.app.resident.target.x[crate::bar_layout::CLOCK].is_none());
+        assert!(h.app.resident.target.width<width,"关闭时间应收回常驻占位");
+        h.hover(Pos2::new(WIN_W/2.0,15.0),1.0);assert!(visible(&h),"展开顶栏仍应显示时间");
+        h.cursor=None;for _ in 0..120{h.frame(vec![]);}
+        for dock in [crate::model::Dock::Left,crate::model::Dock::Right] {
+            h.app.settings.dock=dock;
+            for _ in 0..90{side_frame(&mut h,Some(Pos2::new(250.0,580.0)));}
+            assert!(!h.app.side_items().contains(&crate::side_dock::SideItem::Clock));
+            assert!(!h.shapes.iter().any(|s|matches!(&s.shape,egui::Shape::Text(t)if t.galley.text()=="41")),"侧边收起态也应隐藏时间");
+        }
+        h.app.settings.show_clock=true;h.app.settings.dock=crate::model::Dock::Top;
+        for _ in 0..90{h.frame(vec![]);}
+        assert!(visible(&h));assert_eq!(h.app.resident.target.width,width,"重新开启时间应恢复布局");
+    }
+}
+
+#[test]
+fn clock_residency_switch_in_page_management_saves(){
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    fn draw(h:&mut H,raster:&mut crate::preview_raster::Raster,events:Vec<egui::Event>){
+        let output=std::sync::Arc::new(Mutex::new(None));let capture=output.clone();h.t+=0.02;let time=h.t;
+        egui::Context::set_immediate_viewport_renderer(move|ctx,mut viewport|{
+            let id=viewport.ids.this;
+            *capture.lock().unwrap()=Some(ctx.run(egui::RawInput{viewport_id:id,screen_rect:Some(Rect::from_min_size(Pos2::ZERO,egui::vec2(780.0,1400.0))),time:Some(time),events:events.clone(),viewports:std::iter::once((id,egui::ViewportInfo::default())).collect(),..Default::default()},|ctx|(viewport.viewport_ui_cb)(ctx)));
+        });
+        let root=h.ctx.run(Default::default(),|ctx|h.app.settings_ui(ctx,false));let child=output.lock().unwrap().take().unwrap();
+        raster.update_textures(&root.textures_delta);raster.update_textures(&child.textures_delta);h.shapes=child.shapes;
+    }
+    for dark in [true,false] {
+        let mut h=H::new();h.app.settings.settings_theme=if dark{crate::settings_theme::SettingsTheme::Dark}else{crate::settings_theme::SettingsTheme::Light};
+        h.app.settings_tab=10;h.app.open_settings();h.ctx.set_embed_viewports(false);
+        let mut raster=crate::preview_raster::Raster::new(780,1400);
+        assert!(h.app.settings.show_clock,"已有配置默认保持时间常驻");
+        for _ in 0..3{draw(&mut h,&mut raster,vec![]);}
+        let title=h.shapes.iter().find_map(|s|match &s.shape{egui::Shape::Text(t)if t.galley.text()=="时间"=>Some(t.visual_bounding_rect()),_=>None}).expect("状态组件应提供时间开关");
+        let point=h.shapes.iter().find_map(|s|match &s.shape{egui::Shape::Rect(r)if (r.rect.width()-34.0).abs()<0.01&&(r.rect.height()-20.0).abs()<0.01&&r.rect.center().y>title.top()&&r.rect.center().y<title.bottom()+24.0=>Some(r.rect.center()),_=>None}).unwrap();
+        for expected in [false,true] {
+            for pressed in [true,false]{draw(&mut h,&mut raster,vec![egui::Event::PointerMoved(point),egui::Event::PointerButton{pos:point,button:egui::PointerButton::Primary,pressed,modifiers:Default::default()}]);}
+            draw(&mut h,&mut raster,vec![]);
+            assert_eq!(h.app.settings.show_clock,expected);assert_eq!(crate::model::Settings::load().show_clock,expected,"常驻时间开关应自动保存");
+            let preview=h.shapes.iter().find_map(|s|match &s.shape{egui::Shape::Text(t)if t.galley.text().contains(':')&&t.galley.job.sections.first().is_some_and(|s|(s.format.font_id.size-crate::theme::size::PILL_CLOCK).abs()<0.01)=>Some(t.fallback_color.a()),_=>None}).expect("常驻排列应保留时间的位置");
+            assert_eq!(preview==255,expected,"关闭时间后排列预览应置灰");
+            if let Some(dest)=std::env::var_os("DAOZAI_CLOCK_RESIDENCY_PREVIEW") {
+                let dest=std::path::PathBuf::from(dest);std::fs::create_dir_all(&dest).unwrap();
+                raster.buf.fill([0.08,0.08,0.09,1.0]);raster.draw(&h.ctx.tessellate(h.shapes.clone(),1.0),1.0);let mut rgba=Vec::new();raster.to_rgba8(&mut rgba);
+                image::save_buffer(dest.join(format!("settings-{}-{}.png",if dark{"dark"}else{"light"},if expected{"on"}else{"off"})),&rgba,780,1400,image::ColorType::Rgba8).unwrap();
+            }
+        }
+    }
+}
+
+#[test]
 fn clock_seconds_keep_resident_spacing_and_digit_width(){
     use crate::bar_layout::{CLOCK,WEATHER};
     let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
