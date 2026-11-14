@@ -428,6 +428,16 @@ pub(crate) fn same_song(title:&str,artist:&str,other_title:&str,other_artist:&st
     !a.0.is_empty() && a.0==b.0 && (a.1.is_empty() || b.1.is_empty() || a.1==b.1)
 }
 
+/// 同一会话里前后两次歌曲信息的关系：`Some(true)` 同一首（歌手相同或一方为空），
+/// `Some(false)` 同一首但署名有补全（如单人署名补全为合唱），`None` 不同歌曲。
+pub(crate) fn song_relation(title:&str,artist:&str,other_title:&str,other_artist:&str)->Option<bool> {
+    if same_song(title,artist,other_title,other_artist){return Some(true);}
+    let (a,b)=(song_identity(title,artist),song_identity(other_title,other_artist));
+    if a.0.is_empty() || a.0!=b.0 {return None;}
+    let within=|x:&[String],y:&[String]|x.iter().all(|s|y.contains(s));
+    (within(&a.1,&b.1) || within(&b.1,&a.1)).then_some(false)
+}
+
 fn normalized(text:&str)->String {
     text.chars().flat_map(char::to_lowercase).filter(|c|c.is_alphanumeric()).collect()
 }
@@ -1111,6 +1121,19 @@ mod tests {
         assert!(same_song("Track","","Track","甲"));
         assert!(!same_song("Track (Live)","甲","Track","甲"));
         assert!(!same_song("Track","甲","Track","丙"));
+    }
+
+    #[test]
+    fn song_relation_separates_fill_ins_from_other_songs(){
+        assert_eq!(song_relation("Track","甲","Track","甲"),Some(true));
+        assert_eq!(song_relation("Track","","Track","甲"),Some(true),"歌手从空补全仍是同一首");
+        assert_eq!(song_relation("Track","甲 / 乙","Track","乙、甲"),Some(true));
+        assert_eq!(song_relation("有点甜","汪苏泷","有点甜","汪苏泷、BY2"),Some(false),"单人署名补全为合唱");
+        assert_eq!(song_relation("有点甜","汪苏泷、BY2","有点甜","汪苏泷"),Some(false));
+        assert_eq!(song_relation("Track","甲","Track","丙"),None);
+        assert_eq!(song_relation("Track","甲、乙","Track","甲、丙"),None,"部分重叠不算补全");
+        assert_eq!(song_relation("Track (Live)","甲","Track","甲"),None,"不同版本是不同歌曲");
+        assert_eq!(song_relation("","甲","","甲"),None);
     }
 
     #[test]

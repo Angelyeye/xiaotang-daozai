@@ -8,6 +8,8 @@ mod calendar_compatibility;
 mod doubao;
 #[path="weather_source_ui_tests.rs"]
 mod weather_source;
+#[path="lyrics_switch_ui_tests.rs"]
+mod lyrics_switch;
 use eframe::egui::{self, Pos2, Rect, Vec2};
 use std::sync::Mutex;
 
