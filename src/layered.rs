@@ -107,8 +107,7 @@ impl Layered {
         Ok(Self { display, dc, bitmap: HBITMAP::default(), old: HGDIOBJ::default(), bits: std::ptr::null_mut(), size: (0, 0), last: None })
     }
 
-    #[cfg(test)]
-    pub fn display(&self) -> HWND { self.display }
+    pub(crate) fn display(&self) -> HWND { self.display }
 
     fn ensure_bitmap(&mut self, w: i32, h: i32) -> bool {
         if self.size == (w, h) && !self.bits.is_null() { return true; }

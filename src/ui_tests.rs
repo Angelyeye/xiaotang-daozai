@@ -588,6 +588,64 @@ fn changing_qq_metadata_cannot_spawn_lyrics_workers_while_one_is_running(){
 }
 
 #[test]
+fn top_bar_modes_preserve_legacy_settings_and_save_the_selected_display_mode(){
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());let _h=H::new();
+    use crate::model::Settings;
+    let path=crate::model::config_dir().join("settings.txt");std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let bounds=crate::display_layout::Bounds{left:-1920,top:-400,right:0,bottom:680};
+    let display=crate::display_layout::Display{id:"test".into(),label:"测试屏".into(),bounds,work_top:-368,primary:true};
+    for enabled in [false,true] {
+        std::fs::write(&path,format!("avoid_top_bar={}\n",enabled as u8)).unwrap();
+        let mut settings=Settings::load();
+        assert_eq!(settings.avoid_top_bar,enabled);assert!(!settings.top_bar_on_top,"旧配置默认沿用避让方式");
+        for on_top in [false,true] {
+            settings.top_bar_on_top=on_top;settings.save();let saved=Settings::load();
+            assert_eq!((saved.avoid_top_bar,saved.top_bar_on_top),(enabled,on_top));
+            assert_eq!(crate::display_layout::placement_bounds(&display,saved.avoids_top_bar()).top,if enabled&&!on_top{-368}else{-400},"置顶方式应回到屏幕顶边；关闭适配后不避让");
+        }
+    }
+}
+
+#[test]
+fn top_bar_settings_switch_modes_and_respect_the_master_switch(){
+    fn draw(h:&mut H,events:Vec<egui::Event>,raster:&mut crate::preview_raster::Raster)->egui::FullOutput {
+        h.t+=0.1;let time=h.t;
+        let output=std::sync::Arc::new(Mutex::new(None));let capture=output.clone();
+        egui::Context::set_immediate_viewport_renderer(move|ctx,mut viewport|{
+            let id=viewport.ids.this;
+            let raw=egui::RawInput{viewport_id:id,time:Some(time),focused:true,events:events.clone(),screen_rect:Some(Rect::from_min_size(Pos2::ZERO,egui::vec2(690.0,1800.0))),viewports:std::iter::once((id,egui::ViewportInfo{native_pixels_per_point:Some(1.0),..Default::default()})).collect(),..Default::default()};
+            *capture.lock().unwrap()=Some(ctx.run(raw,|ctx|(viewport.viewport_ui_cb)(ctx)));
+        });
+        let root=h.ctx.run(Default::default(),|ctx|h.app.settings_ui(ctx,false));raster.update_textures(&root.textures_delta);
+        let child=output.lock().unwrap().take().unwrap();raster.update_textures(&child.textures_delta);child
+    }
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    for dark in [true,false] {
+        let mut h=H::new();h.app.open_settings();h.ctx.set_embed_viewports(false);
+        h.app.settings.settings_theme=if dark{crate::settings_theme::SettingsTheme::Dark}else{crate::settings_theme::SettingsTheme::Light};
+        let mut raster=crate::preview_raster::Raster::new(690,1800);
+        for _ in 0..3{let _=draw(&mut h,vec![],&mut raster);}
+        for (on_top,label) in [(true,"岛仔置顶"),(false,"避开顶栏")] {
+            let output=draw(&mut h,vec![],&mut raster);
+            let position=output.shapes.iter().find_map(|s|match &s.shape{egui::Shape::Text(t)if t.galley.text()==label=>{
+                assert!(s.clip_rect.contains_rect(t.visual_bounding_rect()),"显示方式按钮不能裁切");Some(t.visual_bounding_rect().center())
+            },_=>None}).expect("显示方式应提供避让和置顶两个选项");
+            for pressed in [true,false] {let _=draw(&mut h,vec![egui::Event::PointerMoved(position),egui::Event::PointerButton{pos:position,button:egui::PointerButton::Primary,pressed,modifiers:Default::default()}],&mut raster);}
+            assert_eq!(h.app.settings.top_bar_on_top,on_top);assert_eq!(crate::model::Settings::load().top_bar_on_top,on_top,"切换后立即保存");
+            if let Some(dest)=std::env::var_os("DAOZAI_TOP_BAR_PREVIEW_DIR") {
+                let output=draw(&mut h,vec![],&mut raster);raster.buf.fill(if dark{[0.08,0.08,0.09,1.0]}else{[0.96,0.96,0.97,1.0]});
+                raster.draw(&h.ctx.tessellate(output.shapes,output.pixels_per_point),output.pixels_per_point);
+                let mut rgba=Vec::new();raster.to_rgba8(&mut rgba);let dest=std::path::PathBuf::from(dest);std::fs::create_dir_all(&dest).unwrap();
+                image::save_buffer(dest.join(format!("top-bar-{}-{}.png",if dark{"dark"}else{"light"},if on_top{"on-top"}else{"avoid"})),&rgba,690,1800,image::ColorType::Rgba8).unwrap();
+            }
+        }
+        h.app.settings.avoid_top_bar=false;
+        let output=draw(&mut h,vec![],&mut raster);
+        assert!(!output.shapes.iter().any(|s|matches!(&s.shape,egui::Shape::Text(t)if t.galley.text()=="岛仔置顶")),"关闭适配后收起显示方式选项");
+    }
+}
+
+#[test]
 fn v0649_settings_and_mail_accounts_survive_upgrade(){
     let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());let _h=H::new();
     let directory=crate::model::config_dir();

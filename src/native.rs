@@ -328,6 +328,27 @@ fn surface_needs_outline_clip(backend:Option<eframe::wgpu::Backend>,vendor:&str,
     })
 }
 
+/// 只识别同屏顶部的宽条窗口，普通弹窗、全屏窗口和其他屏幕不触发抬高。
+unsafe fn top_bar_above(hwnd:HWND,bounds:crate::display_layout::Bounds)->bool {
+    let mut island=RECT::default();
+    if !IsWindowVisible(hwnd).as_bool() || GetWindowRect(hwnd,&mut island).is_err(){return false;}
+    let mut current=hwnd;
+    while let Ok(previous)=GetWindow(current,GW_HWNDPREV) {
+        current=previous;
+        if !IsWindowVisible(current).as_bool() || GetWindowLongPtrW(current,GWL_EXSTYLE)&WS_EX_TOPMOST.0 as isize==0 {continue;}
+        let mut bar=RECT::default();
+        if GetWindowRect(current,&mut bar).is_ok()
+            && bar.top<=bounds.top && bar.bottom>bounds.top
+            && bar.bottom-bar.top<=(bounds.bottom-bounds.top)/8
+            && bar.right-bar.left>=(bounds.right-bounds.left)/2
+            && bar.left<island.right && bar.right>island.left
+            && bar.bottom>island.top {
+            return true;
+        }
+    }
+    false
+}
+
 /// 兼容后端的分层窗口状态：先按轮廓裁剪，读回到带透明的画面后再切到分层窗口。
 #[derive(Default)]
 enum Layering {
@@ -357,6 +378,15 @@ pub struct Window {
 
 impl Window {
     pub fn hwnd(&self)->HWND {self.hwnd}
+
+    /// 顶栏重新置顶后恢复岛体层级；没有遮挡时不修改窗口顺序，也不激活窗口。
+    pub fn keep_above_top_bar(&mut self,bounds:crate::display_layout::Bounds) {
+        let display=match &self.layering {Layering::Active(layered)=>layered.display(),_=>self.hwnd};
+        if unsafe{top_bar_above(display,bounds)} {
+            unsafe{let _=SetWindowPos(self.hwnd,HWND_TOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);}
+            if let Layering::Active(layered)=&mut self.layering {layered.sync(self.hwnd,true);}
+        }
+    }
 
     pub fn new(cc: &eframe::CreationContext<'_>) -> Option<Self> {
         let RawWindowHandle::Win32(handle) = cc.window_handle().ok()?.as_raw() else { return None };
@@ -677,6 +707,48 @@ mod tests {
         assert!(!capture.update(true,Some((300,60)),zone,(4,4)),"下一次点击不能沿用上次拖动状态");
         assert!(!capture.update(true,None,zone,(4,4)));
         assert!(!capture.update(true,Some((300,60)),None,(4,4)));
+    }
+
+    #[test]
+    fn top_bar_mode_restores_z_order_without_raising_over_unrelated_windows(){
+        let _guard=NATIVE_STATE_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+        struct TestWindow(HWND);
+        impl Drop for TestWindow {fn drop(&mut self){unsafe{let _=DestroyWindow(self.0);}}}
+        unsafe fn above(first:HWND,second:HWND)->bool {
+            let mut current=first;
+            while let Ok(next)=GetWindow(current,GW_HWNDNEXT){if next==second{return true;}current=next;}
+            false
+        }
+        unsafe {
+            let bounds=crate::display_layout::Bounds{left:-10480,top:-10000,right:-8560,bottom:-8920};
+            let flags=SWP_NOACTIVATE|SWP_SHOWWINDOW;
+            let create=||TestWindow(CreateWindowExW(WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW|WS_EX_TOPMOST,windows::core::w!("STATIC"),windows::core::w!(""),WS_POPUP|WS_VISIBLE,-10000,-10000,416,140,None,None,None,None).unwrap());
+            for layered in [false,true] {
+                let island=create();let cover=create();
+                let mut native=Window{hwnd:island.0,layering:Layering::Pending,region:(0,0,0,0),expanded:false,hook:HWINEVENTHOOK::default(),browser_state:(None,PollClock::now()),drag_capture:DragCapture::default(),glass:None,backdrop:None,blur:false,blur_unavailable:false,opaque_surface:false};
+                if layered {
+                    let mut display=crate::layered::Layered::new().unwrap();
+                    display.present(island.0,[416,140],&vec![0;416*140*4]).unwrap();
+                    native.layering=Layering::Active(display);
+                }
+                let display=match &native.layering {Layering::Active(layered)=>layered.display(),_=>island.0};
+                let foreground=GetForegroundWindow();
+                SetWindowPos(cover.0,HWND_TOPMOST,bounds.left,bounds.top,1920,32,flags).unwrap();
+                assert!(top_bar_above(display,bounds),"复现顶栏遮挡，兼容渲染={layered}");
+                native.keep_above_top_bar(bounds);
+                assert!(!top_bar_above(display,bounds),"收起时也应恢复实际层级，兼容渲染={layered}");
+                assert_eq!(GetForegroundWindow(),foreground,"置顶不能抢走输入焦点");
+                for (x,y,w,h) in [(-10000,-10000,400,140),(-10480,-10000,1920,300),(-10480,-10000,1920,1080),(-10480,-9600,1920,32),(-12400,-10000,1920,32)] {
+                    SetWindowPos(cover.0,HWND_TOPMOST,x,y,w,h,flags).unwrap();
+                    assert!(!top_bar_above(display,bounds),"普通弹窗、全屏窗口和其他屏幕不触发顶栏适配");
+                    native.keep_above_top_bar(bounds);
+                    assert!(above(cover.0,display),"不应越过无关弹窗争抢置顶");
+                }
+                SetWindowPos(cover.0,HWND_TOPMOST,bounds.left,bounds.top,1920,32,flags).unwrap();
+                let _=ShowWindow(cover.0,SW_HIDE);
+                assert!(!top_bar_above(display,bounds),"隐藏的顶栏不触发抬高");
+            }
+        }
     }
 
     #[test]
