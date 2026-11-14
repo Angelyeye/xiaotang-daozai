@@ -1567,3 +1567,37 @@ mod tests {
         }
     }
 }
+
+#[cfg(all(test,windows))]
+mod read_cost {
+    use super::*;
+    #[test]
+    #[ignore="本机实测：每一类读取在真实环境下每轮花多少时间（只读，不改播放状态）"]
+    fn live_read_cost_per_poll(){
+        let _apartment=init_winrt();
+        let mut artwork=ArtworkCache::default();
+        let mut netease=netease_playback::Reader::default();let mut bodian=bodian::Reader::default();let mut kuwo=kuwo::Reader::default();
+        let mut cost=[std::time::Duration::ZERO;4];let rounds=40;
+        let mut last=None;
+        for _ in 0..rounds {
+            let t=std::time::Instant::now();last=query(&mut artwork);cost[0]+=t.elapsed();
+            let t=std::time::Instant::now();let _=netease.poll();cost[1]+=t.elapsed();
+            let t=std::time::Instant::now();let _=bodian.poll();cost[2]+=t.elapsed();
+            let t=std::time::Instant::now();let _=kuwo.poll();cost[3]+=t.elapsed();
+            std::thread::sleep(POLL_FAST);
+        }
+        let media=last.unwrap_or_default();
+        println!("当前：{} · {} 时长{:.1}",media.source,media.title,media.duration);
+        for (name,total) in ["系统会话(含酷狗/网易云补全)","网易云日志","波点","酷我"].iter().zip(cost){println!("{name}: 平均 {:?}/轮",total/rounds);}
+    }
+}
+#[cfg(all(test,windows))]
+#[test]
+#[ignore="本机实测：一次进程快照、一次波点/酷我发现各要多久"]
+fn live_discovery_cost(){
+    let t=std::time::Instant::now();for _ in 0..20{let _=player_process::pids_named("bodian_pc.exe");}println!("进程快照: {:?}/次",t.elapsed()/20);
+    let t=std::time::Instant::now();let n=netease_timeline::kugou_position();println!("酷狗进度(含首次发现): {:?} {:?}",t.elapsed(),n);
+    let t=std::time::Instant::now();for _ in 0..20{let _=netease_timeline::kugou_position();}println!("酷狗进度: {:?}/次",t.elapsed()/20);
+    let mut cache=kugou_metadata::Cache::default();
+    let t=std::time::Instant::now();for _ in 0..20{let _=cache.get("x","y",false);}println!("酷狗窗口核对: {:?}/次",t.elapsed()/20);
+}
