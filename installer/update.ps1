@@ -34,6 +34,17 @@ try {
         $entries = @($zip.Entries | Where-Object {$_.FullName.Replace('\','/') -ceq $name})
         if ($entries.Count -ne 1 -or $entries[0].Length -gt 200MB) { throw '更新包中缺少唯一的岛仔程序。' }
         [IO.Compression.ZipFileExtensions]::ExtractToFile($entries[0], $staged)
+        # 诊断工具随更新补齐（旧版安装没有）；缺少或解压失败都不影响程序本身的更新。
+        $tools = @()
+        foreach ($tool in @('收集岛仔诊断.cmd', 'scripts/collect-diagnostics.ps1')) {
+            try {
+                $toolEntry = @($zip.Entries | Where-Object {$_.FullName.Replace('\','/') -ceq ('Daozai-v' + $version + '-windows-x64/' + $tool)})
+                if ($toolEntry.Count -ne 1 -or $toolEntry[0].Length -gt 1MB) { continue }
+                $toolStaged = Join-Path $workRoot ('tool-' + $tools.Count)
+                [IO.Compression.ZipFileExtensions]::ExtractToFile($toolEntry[0], $toolStaged)
+                $tools += ,@($toolStaged, $tool.Replace('/', '\'))
+            } catch { }
+        }
     } finally { $zip.Dispose() }
     $actual = [Diagnostics.FileVersionInfo]::GetVersionInfo($staged).FileVersion
     if ($actual -ne $version -and $actual -ne "$version.0") { throw '安装包版本不匹配。' }
@@ -47,13 +58,22 @@ try {
     [IO.File]::Copy($target, $backup, $true)
     [IO.File]::Replace($staged, $target, [NullString]::Value)
     $replaced = $true
+    foreach ($tool in $tools) {
+        try {
+            $toolTarget = Join-Path $targetDir $tool[1]
+            $toolDirectory = Split-Path $toolTarget -Parent
+            if (-not (Test-Path -LiteralPath $toolDirectory)) { $null = New-Item -ItemType Directory -Path $toolDirectory }
+            Assert-PlainPath $toolTarget
+            [IO.File]::Copy($tool[0], $toolTarget, $true)
+        } catch { }
+    }
     Start-Process -FilePath $target -WorkingDirectory $targetDir -WindowStyle Hidden
     $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Daozai'
     $registered = Get-ItemProperty -LiteralPath $key -ErrorAction SilentlyContinue
     if ($registered -and [string]::Equals($registered.InstallLocation.TrimEnd('\'), $targetDir, [StringComparison]::OrdinalIgnoreCase)) {
         Set-ItemProperty -LiteralPath $key -Name DisplayVersion -Value $version -ErrorAction SilentlyContinue
         # 只统计岛仔自己的文件，软件管家不会把共享安装文件夹的大小算到岛仔头上。
-        $own = @('daozai.exe','Uninstall.exe','LICENSE','THIRD_PARTY_NOTICES.txt') | ForEach-Object { Join-Path $targetDir $_ } | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf }
+        $own = @('daozai.exe','Uninstall.exe','LICENSE','THIRD_PARTY_NOTICES.txt','收集岛仔诊断.cmd','scripts\collect-diagnostics.ps1') | ForEach-Object { Join-Path $targetDir $_ } | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf }
         $sizeKb = [int][Math]::Ceiling((($own | ForEach-Object { (Get-Item -LiteralPath $_).Length }) | Measure-Object -Sum).Sum / 1KB)
         if ($sizeKb -gt 0) { Set-ItemProperty -LiteralPath $key -Name EstimatedSize -Value $sizeKb -Type DWord -ErrorAction SilentlyContinue }
     }
