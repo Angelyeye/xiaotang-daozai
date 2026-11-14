@@ -8,21 +8,25 @@ pub(crate) const ADAPTER:NativeAdapter=NativeAdapter{paths,main_frame,accounts:S
 fn main_frame(class:&str,style:u32,extended:u32)->bool{matches!(class,"Chrome_WidgetWin_1"|"TXGuiFoundation") && frame_style(class,style,extended)}
 fn open(unread:Unread,paths:&[String],_:bool)->Result<(),OpenError>{unsafe{
     let window=HWND(unread.window as *mut _);
-    if unread.window==0 || !IsWindow(window).as_bool() || window_pid(window)!=unread.pid{return Err(OpenError::Unavailable);}
+    if unread.window==0 || !IsWindow(window).as_bool() || window_pid(window)!=unread.pid{wake_step("提醒窗口已不属于该账号");return Err(OpenError::Unavailable);}
     let target=if usable_main_frame(window,unread.source) && matches(window,paths){Some(window)}else{visible_main_window_of(unread.pid,unread.source,paths)};
     if let Some(target)=target{
+        wake_step(format!("切前台 {}",describe_window(target)));
         if IsIconic(target).as_bool(){let _=ShowWindowAsync(target,SW_RESTORE);}
-        if SetForegroundWindow(target).as_bool(){return Ok(());}
-    }
+        if SetForegroundWindow(target).as_bool(){wake_step("系统已接受");return Ok(());}
+        wake_step("系统拒绝切前台");
+    }else{wake_step("没有可见的 QQ 主窗口");}
     if class_name(window)=="Electron_NotifyIconHostWindow" && matches(window,paths){
         let icons=host_icons(&[(unread.pid,window)],unread.pid);
         if let [(_,id)]=icons.as_slice(){
+            wake_step(format!("点击 QQ 托盘图标 {id}"));
             for event in [WM_LBUTTONDOWN,WM_LBUTTONUP,WM_LBUTTONDBLCLK,WM_LBUTTONUP]{
-                PostMessageW(window,WM_APP+1,WPARAM(*id as usize),LPARAM(event as isize)).map_err(|_|OpenError::Failed("QQ 托盘暂时无法响应".into()))?;
+                PostMessageW(window,WM_APP+1,WPARAM(*id as usize),LPARAM(event as isize)).map_err(|_|{wake_step("托盘消息发送失败");OpenError::Failed("QQ 托盘暂时无法响应".into())})?;
             }
             return Ok(());
         }
-    }
+        wake_step(format!("托盘宿主窗口里有 {} 个该账号的图标，无法确定点哪个",icons.len()));
+    }else{wake_step(format!("提醒窗口不是 QQ 托盘宿主（{}）",class_name(window)));}
     Err(OpenError::Unavailable)
 }}
 
@@ -99,6 +103,20 @@ pub(crate) fn accounts(paths:&[String])->Option<Vec<Target>>{unsafe{
 #[cfg(test)]
 mod tests{
     use super::*;
+    #[test]
+    fn qq_wake_records_why_neither_window_nor_tray_could_be_used(){unsafe{
+        let window=CreateWindowExW(WINDOW_EX_STYLE(0),w!("STATIC"),w!(""),WS_POPUP,0,0,10,10,None,None,None,None).unwrap();
+        let paths=[normalized(&std::env::current_exe().unwrap().to_string_lossy())];
+        take_wake_steps();
+        let result=open(Unread{source:Messenger::Qq,pid:std::process::id(),window:window.0 as isize},&paths,true);
+        let steps=take_wake_steps();
+        let _=DestroyWindow(window);
+        assert_eq!(result,Err(OpenError::Unavailable));
+        assert_eq!(steps,["没有可见的 QQ 主窗口".to_string(),"提醒窗口不是 QQ 托盘宿主（Static）".to_string()],"依次记录切前台和托盘两条路为什么都走不通");
+        take_wake_steps();
+        let gone=open(Unread{source:Messenger::Qq,pid:std::process::id(),window:0},&paths,true);
+        assert_eq!((gone,take_wake_steps()),(Err(OpenError::Unavailable),vec!["提醒窗口已不属于该账号".to_string()]));
+    }}
     #[test]
     fn qq_single_tray_account_ignores_its_auxiliary_main_windows(){unsafe{
         use windows::Win32::{Foundation::LRESULT,System::LibraryLoader::GetModuleHandleW,UI::Shell::*};

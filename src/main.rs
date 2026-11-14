@@ -486,6 +486,7 @@ impl eframe::App for Shell {
                         self.app.messenger_unavailable(error.message(unread.source));
                     }
                     Err(std::sync::mpsc::TryRecvError::Disconnected)=>{
+                        messenger::windows::trace(format!("唤起 {} 账号 {}：唤起线程异常结束，未返回结果",unread.source.name(),unread.pid));
                         self.tray_opening=None;self.app.messenger_unavailable(format!("{} 暂时无法响应，请重试",unread.source.name()));
                     }
                     Err(std::sync::mpsc::TryRecvError::Empty)=>{}
@@ -495,9 +496,17 @@ impl eframe::App for Shell {
                 if !self.app.pending_messengers.contains(&unread){self.opening_messenger=None;}
                 else if started.elapsed()>=Duration::from_secs(4){
                     self.opening_messenger=None;
+                    // 打开请求被接受不代表窗口真的出来了：4 秒后核对一次，结果记入唤起日志。
                     match self.messengers.foreground(&[unread.source]){
-                        Some((source,pid)) if unread.pid==0||unread.pid==pid=>{self.messengers.viewed_client(source,pid);self.app.viewed_client(source,pid);},
-                        _=>self.app.messenger_unavailable(format!("{}尚未切到前台，可点图标重试",unread.source.name())),
+                        Some((source,pid)) if unread.pid==0||unread.pid==pid=>{
+                            messenger::windows::trace(format!("唤起 {} 账号 {}：4 秒后核对，已在前台",unread.source.name(),unread.pid));
+                            self.messengers.viewed_client(source,pid);self.app.viewed_client(source,pid);
+                        },
+                        other=>{
+                            let seen=other.map(|(source,pid)|format!("前台是 {} 的另一个账号 {pid}",source.name())).unwrap_or_else(||format!("前台是 {}",messenger::windows::describe_foreground()));
+                            messenger::windows::trace(format!("唤起 {} 账号 {}：4 秒后核对，未到前台（{seen}）",unread.source.name(),unread.pid));
+                            self.app.messenger_unavailable(format!("{}尚未切到前台，可点图标重试",unread.source.name()));
+                        }
                     }
                 }
             }
@@ -613,13 +622,22 @@ impl eframe::App for Shell {
                         let was_pending=self.app.pending_messengers.contains(&unread);
                         self.clear_exited_messengers(ctx);
                         if !self.app.pending_messengers.contains(&unread){
-                            if was_pending{self.app.messenger_unavailable(OpenError::Exited.message(unread.source));}
+                            if was_pending{
+                                messenger::windows::trace(format!("唤起 {} 账号 {}：未开始，账号进程已退出",unread.source.name(),unread.pid));
+                                self.app.messenger_unavailable(OpenError::Exited.message(unread.source));
+                            }
                             continue;
                         }
-                        if self.tray_opening.is_some(){self.app.messenger_unavailable(OpenError::Busy.message(unread.source));ctx.request_repaint();continue;}
+                        if self.tray_opening.is_some(){
+                            messenger::windows::trace(format!("唤起 {} 账号 {}：未开始，上一次唤起还没结束",unread.source.name(),unread.pid));
+                            self.app.messenger_unavailable(OpenError::Busy.message(unread.source));ctx.request_repaint();continue;
+                        }
                         match self.messengers.request(unread,&self.app.settings).start(ctx.clone()){
                             Ok(rx)=>self.tray_opening=Some((unread,rx)),
-                            Err(error)=>{self.app.messenger_unavailable(error.message(unread.source));ctx.request_repaint();}
+                            Err(error)=>{
+                                messenger::windows::trace(format!("唤起 {} 账号 {}：未开始 {error:?}",unread.source.name(),unread.pid));
+                                self.app.messenger_unavailable(error.message(unread.source));ctx.request_repaint();
+                            }
                         }
                     }
                 }

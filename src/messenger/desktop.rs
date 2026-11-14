@@ -92,11 +92,14 @@ fn ready_with_paths(target:Target,paths:&[String])->bool{
 }
 fn open(unread:Unread,paths:&[String],_:bool)->Result<(),OpenError>{unsafe{
     let window=HWND(unread.window as *mut _);
-    if unread.pid==0 || window_pid(window)!=unread.pid || !main_window(window,unread.source) || !matches(window,paths){return Err(OpenError::Unavailable);}
+    if unread.pid==0 || window_pid(window)!=unread.pid {wake_step("提醒窗口已不属于该账号");return Err(OpenError::Unavailable);}
+    if !main_window(window,unread.source){wake_step(format!("提醒窗口不是主窗口（{}）",describe_window(window)));return Err(OpenError::Unavailable);}
+    if !matches(window,paths){wake_step("提醒窗口所属程序不在已知安装路径中");return Err(OpenError::Unavailable);}
     // 不执行协议、托盘回调或鼠标键盘模拟，只恢复该消息保存的主窗口。
+    wake_step(format!("切前台 {}",describe_window(window)));
     if IsIconic(window).as_bool(){let _=ShowWindowAsync(window,SW_RESTORE);}
     else if !IsWindowVisible(window).as_bool(){let _=ShowWindowAsync(window,SW_SHOW);}
-    if SetForegroundWindow(window).as_bool(){Ok(())}else{Err(OpenError::Unavailable)}
+    if SetForegroundWindow(window).as_bool(){wake_step("系统已接受");Ok(())}else{wake_step("系统拒绝切前台");Err(OpenError::Unavailable)}
 }}
 
 #[cfg(test)]
