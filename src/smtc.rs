@@ -27,6 +27,9 @@ mod player_seek;
 #[cfg(windows)]
 #[path="player_process.rs"]
 pub(crate) mod player_process;
+#[cfg(windows)]
+#[path="music_log.rs"]
+mod music_log;
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -304,6 +307,7 @@ fn query_system(artwork:&mut ArtworkCache) -> Result<Option<NowPlaying>,()> {
         media.map(|media|(session,media))
     })
         .min_by_key(|(_,media)|media_rank(media)).ok_or(())?;
+    music_log::player(&media.source);
     // 当前播放器正在重载时，不把暂停中的另一客户端当成用户切换了播放源。
     if media_rank(&media)>0 && unreadable_previous{return Err(());}
     let key=format!("{}|{}|{}|{}",media.source,media.title,media.artist,media.album);
@@ -481,7 +485,11 @@ pub fn seek(seconds:f64,source:&str)->bool {
     static LOCK:Mutex<()>=Mutex::new(());
     let Ok(_lock)=LOCK.lock()else{return false;};
     if source.eq_ignore_ascii_case("kwmusic.exe"){return kuwo::seek(seconds);}
-    if matches!(source.to_ascii_lowercase().as_str(),"kugou"|"kugou.exe") && kugou_control::seek(seconds){return true;}
+    if matches!(source.to_ascii_lowercase().as_str(),"kugou"|"kugou.exe") {
+        let native=kugou_control::seek(seconds);
+        music_log::state("酷狗跳转",if native{"本机接口可用"}else{"本机接口不可用，改用系统跳转"});
+        if native{return true;}
+    }
     let _apartment=init_winrt();
     use windows::Media::Control::GlobalSystemMediaTransportControlsSessionManager as Manager;
     let session=media_result(Manager::RequestAsync).and_then(|mgr|mgr.GetSessions().ok())

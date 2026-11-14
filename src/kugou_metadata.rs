@@ -77,6 +77,23 @@ fn current(title:&str,artist:&str)->Option<(u32,String)>{
     search.result
 }
 
+/// 酷狗主窗口的歌曲标题（「歌手 - 歌名 - 酷狗音乐」），只取酷狗进程的窗口，供诊断时对照写法。
+fn kugou_windows()->Vec<String>{
+    unsafe extern "system" fn visit(window:Handle,param:isize)->i32{
+        let found=&mut *(param as *mut Vec<String>);
+        let mut text=[0u16;1024];let len=GetWindowTextW(window,text.as_mut_ptr(),1024);
+        if len<=0{return 1;}
+        let text=String::from_utf16_lossy(&text[..len as usize]);
+        let Some(song)=text.trim().strip_suffix(" - 酷狗音乐")else{return 1;};
+        let mut pid=0;GetWindowThreadProcessId(window,&mut pid);
+        if found.len()<4 && super::player_process::image_is(pid,"KuGou.exe") && !found.iter().any(|s|s==song){found.push(song.to_owned());}
+        1
+    }
+    let mut found=Vec::new();
+    unsafe{EnumWindows(visit,&mut found as *mut Vec<String> as isize);}
+    found
+}
+
 /// 一轮扫描的进度：跨多次轮询接着扫，扫到地址空间末尾绕回开头，回到起点即完成一整圈。
 #[derive(Clone,Copy,Debug,Default)]
 struct Scan {cursor:usize,start:usize,wrapped:bool,spent:Duration,bytes:u64}
@@ -148,8 +165,25 @@ pub struct Cache {
     scan:Option<Scan>,resume:usize,
     /// 上一首命中的进程和内存区块：换歌后优先从这里扫，歌曲信息通常落在同一片内存。
     hint:Option<(u32,usize)>,
+    /// 找不到对应酷狗窗口的歌曲：标题、歌手、开始时间、是否已写进诊断日志。
+    missing:Option<(String,String,Instant,bool)>,
 }
 impl Cache {
+    /// 同一首歌持续 3 秒对不上酷狗窗口时，把两边的写法各记一次（切歌瞬间的短暂不同步不记）。
+    fn report_miss(&mut self,title:&str,artist:&str){
+        if !self.missing.as_ref().is_some_and(|(t,a,..)|t==title && a==artist) {
+            self.missing=Some((title.to_owned(),artist.to_owned(),Instant::now(),false));
+        }
+        let Some((_,_,since,reported))=self.missing.as_mut() else{return;};
+        if *reported || since.elapsed()<Duration::from_secs(3) {return;}
+        *reported=true;
+        let windows=kugou_windows();
+        let shown=if windows.is_empty(){"无".to_owned()}else{windows.iter().map(|text|format!("{text}（{}字）",text.chars().count())).collect::<Vec<_>>().join("；")};
+        let line=format!("{} 酷狗曲长 · {title} - {artist}（{}字）→ 未匹配到酷狗窗口，窗口标题：{shown}
+",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),title.chars().count()+artist.chars().count()+3);
+        if !cfg!(test) {crate::resources::append_log(&crate::model::config_dir().join("diagnostics"),"lyrics.log",&line);}
+    }
     fn recent_key(&self,title:&str,artist:&str)->Option<(u32,String)>{
         if self.seen?.elapsed()>Duration::from_secs(2){return None;}
         let key=self.key.as_ref()?;
@@ -173,7 +207,10 @@ impl Cache {
     /// `need_duration` 为假（系统已给出有效曲长）时只用窗口标题补全歌手，不扫描进程内存。
     pub fn get(&mut self,title:&str,artist:&str,need_duration:bool)->Option<(String,f64)>{
         // 循环重载时窗口标题会短暂消失；同一首歌最多沿用两秒已核对的身份。
-        let key=if let Some(key)=self.window(title,artist,false){self.seen=Some(Instant::now());key}else{self.recent_key(title,artist)?};
+        let key=if let Some(key)=self.window(title,artist,false){self.seen=Some(Instant::now());key}
+            else if let Some(key)=self.recent_key(title,artist){key}
+            else{self.report_miss(title,artist);return None;};
+        self.missing=None;
         if self.key.as_ref()!=Some(&key){
             self.key=Some(key.clone());self.value=None;self.checked=None;self.failures=0;self.scan=None;
             self.resume=self.hint.filter(|(pid,_)|*pid==key.0).map_or(0,|(_,base)|base);
@@ -219,6 +256,17 @@ mod tests {
         }
         for artist in ["添儿","另一歌手","添儿呗、另一歌手"] {assert!(window_filename(window,"溺云歌",artist).is_none());}
         assert!(window_filename(window,"溺云歌 (Live)","添儿呗").is_none());
+    }
+    #[test]
+    fn window_mismatch_is_reported_once_after_it_persists(){
+        let mut cache=Cache::default();
+        cache.report_miss("See Tình","Hoàng Thùy Linh");
+        assert!(cache.missing.as_ref().is_some_and(|m|!m.3),"刚切歌时的短暂不同步不记");
+        cache.missing.as_mut().unwrap().2=Instant::now()-Duration::from_secs(4);
+        cache.report_miss("See Tình","Hoàng Thùy Linh");
+        assert!(cache.missing.as_ref().is_some_and(|m|m.3));
+        cache.report_miss("别的歌","Hoàng Thùy Linh");
+        assert!(cache.missing.as_ref().is_some_and(|m|m.0=="别的歌" && !m.3),"换歌重新计时");
     }
     #[test]
     fn failed_scans_back_off_then_stop_for_the_same_song(){
