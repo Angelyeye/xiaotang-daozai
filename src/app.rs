@@ -1601,7 +1601,7 @@ impl App {
 
     fn island_lyrics_active(&self)->bool {
         if self.side() {return false;}
-        self.settings.island_lyrics && self.settings.visible_pages[0] && self.media.is_music()
+        self.settings.island_lyrics && self.settings.visible_pages[0] && self.media.is_music() && self.media.playing
             && !self.browser_minimal_active
     }
     pub(crate) fn compact_notices(&self)->bool {self.island_lyrics_active()&&!self.open&&!self.notice.as_ref().is_some_and(|a|a.meeting.is_some()||self.settings.notification_preview&&matches!(a.source,crate::extras::AlertSource::External(_)))}
