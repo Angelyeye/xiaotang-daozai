@@ -6108,6 +6108,95 @@ fn hover_tooltips_fit_native_region_and_release_it_after_leaving(){
 }
 
 #[test]
+fn clock_seconds_formats_and_persists(){
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    let mut h=H::new();assert!(!h.app.settings.clock_seconds);
+    assert_eq!(h.app.settings.clock_text("23:59:58"),"23:59");
+    h.app.settings.clock_seconds=true;
+    for (input,expected) in [("00:00:00","00:00:00"),("23:59:59","23:59:59"),("13:05","13:05:00"),("invalid","--:--:--")] {
+        assert_eq!(h.app.settings.clock_text(input),expected);
+    }
+    h.app.settings.clock_12h=true;h.app.settings.clock_period=1;
+    for (input,expected) in [("00:00:01","上午 12:00:01"),("12:00:00","下午 12:00:00"),("13:05:08","下午 1:05:08")] {
+        assert_eq!(h.app.settings.clock_text(input),expected);
+    }
+    h.app.settings.clock_period=2;
+    assert_eq!(h.app.settings.clock_text("23:59:59"),"晚上 11:59:59");
+    for enabled in [true,false] {
+        h.app.settings.clock_seconds=enabled;h.app.settings.save();
+        assert_eq!(crate::model::Settings::load().clock_seconds,enabled);
+    }
+}
+
+#[test]
+fn clock_seconds_keep_resident_spacing_and_digit_width(){
+    use crate::bar_layout::{CLOCK,WEATHER};
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    for period in 0..=2 {for twelve in [false,true] {
+        let mut h=H::new();h.app.settings.pet=false;h.app.settings.clock_seconds=true;
+        h.app.settings.clock_period=period;h.app.settings.clock_12h=twelve;
+        h.quota_accounts(3);h.power=(Some(76),true);
+        h.app.weather.snapshot=Some(crate::weather::Snapshot{place:"杭州".into(),temp:19.0,..Default::default()});
+        for reversed in [false,true] {
+            h.app.settings.resident_order=crate::bar_layout::DEFAULT_ORDER.to_vec();
+            if reversed {h.app.settings.resident_order.reverse();}
+            for _ in 0..90 {h.frame(vec![]);}
+            let digits=if twelve {"9:41:00"}else{"09:41:00"};
+            let text=h.shapes.iter().find_map(|s|match &s.shape{egui::Shape::Text(t)if t.galley.text()==digits=>Some(t.visual_bounding_rect()),_=>None}).expect("收起时应显示秒数");
+            let temp=h.shapes.iter().find_map(|s|match &s.shape{egui::Shape::Text(t)if t.galley.text()=="19°"=>Some(t.visual_bounding_rect()),_=>None}).unwrap();
+            assert!(!text.expand(4.0).intersects(temp),"时钟和天气应保持间距");
+            let layout=h.app.resident.current();
+            assert!((layout.x[CLOCK].unwrap()-layout.x[WEATHER].unwrap()).abs()>(layout.widths[CLOCK]+layout.widths[WEATHER])/2.0,"排列反转后仍需预留秒数宽度");
+        }
+        let _=h.ctx.run(Default::default(),|ctx|{egui::CentralPanel::default().show(ctx,|ui|{
+            let c=crate::paint::Card::new(ui,Pos2::ZERO,ui.max_rect());
+            let widths:Vec<_>=(0..60).map(|second|crate::paint::clock_width(&c,&h.app.settings.clock_text(&format!("09:41:{second:02}")),crate::theme::size::PILL_CLOCK)).collect();
+            assert!(widths.iter().all(|w|(w-widths[0]).abs()<0.01),"秒数变化不应改变时钟占位");
+        });});
+        h.app.show_page(0);h.hover(H::local(200.0,40.0),1.0);
+        assert!(h.shapes.iter().any(|s|matches!(&s.shape,egui::Shape::Text(t)if t.galley.text()==if twelve{"9:41:00"}else{"09:41:00"})),"展开后顶栏也应显示秒数");
+        h.t+=5.0;
+        for dock in [crate::model::Dock::Left,crate::model::Dock::Right] {
+            h.app.settings.dock=dock;
+            for _ in 0..90 {side_frame(&mut h,Some(Pos2::new(250.0,580.0)));}
+            assert!(h.shapes.iter().any(|s|matches!(&s.shape,egui::Shape::Text(t)if t.galley.text()=="00")),"侧边收起时应显示秒数");
+        }
+    }}
+}
+
+#[test]
+fn clock_seconds_setting_toggles_and_saves(){
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    let mut h=H::new();h.app.open_settings();h.ctx.set_embed_viewports(false);
+    let mut raster=crate::preview_raster::Raster::new(780,1800);
+    fn frame(h:&mut H,raster:&mut crate::preview_raster::Raster,events:Vec<egui::Event>){
+        h.t+=1.0/60.0;let time=h.t;
+        let output=std::sync::Arc::new(Mutex::new(None));let capture=output.clone();
+        egui::Context::set_immediate_viewport_renderer(move|ctx,mut viewport|{
+            let id=viewport.ids.this;
+            *capture.lock().unwrap()=Some(ctx.run(egui::RawInput{time:Some(time),viewport_id:id,screen_rect:Some(Rect::from_min_size(Pos2::ZERO,egui::vec2(780.0,1800.0))),events:events.clone(),viewports:std::iter::once((id,egui::ViewportInfo{native_pixels_per_point:Some(1.0),..Default::default()})).collect(),..Default::default()},|ctx|(viewport.viewport_ui_cb)(ctx)));
+        });
+        let root=h.ctx.run(egui::RawInput{time:Some(time),..Default::default()},|ctx|h.app.settings_ui(ctx,false));let child=output.lock().unwrap().take().unwrap();
+        raster.update_textures(&root.textures_delta);raster.update_textures(&child.textures_delta);h.shapes=child.shapes;
+    }
+    for _ in 0..3{frame(&mut h,&mut raster,vec![]);}
+    let label=|h:&H|h.shapes.iter().find_map(|s|match &s.shape{egui::Shape::Text(t)if t.galley.text()=="显示秒数"&&s.clip_rect.contains_rect(t.visual_bounding_rect())=>Some(t.visual_bounding_rect()),_=>None});
+    assert!(!h.app.settings.clock_seconds);
+    for enabled in [true,false] {
+        let title=label(&h).expect("常规设置应提供显示秒数开关");
+        let toggle=h.shapes.iter().find_map(|s|match &s.shape{egui::Shape::Rect(r)if (r.rect.width()-34.0).abs()<0.1&&(r.rect.height()-20.0).abs()<0.1&&(r.rect.top()-title.top()).abs()<18.0=>Some(r.rect.center()),_=>None}).expect("秒数开关应与文字对齐");
+        for pressed in [true,false]{frame(&mut h,&mut raster,vec![egui::Event::PointerMoved(toggle),egui::Event::PointerButton{pos:toggle,button:egui::PointerButton::Primary,pressed,modifiers:Default::default()}]);}
+        frame(&mut h,&mut raster,vec![]);
+        assert_eq!(h.app.settings.clock_seconds,enabled);assert_eq!(crate::model::Settings::load().clock_seconds,enabled);
+        if let Some(dest)=std::env::var_os("DAOZAI_CLOCK_PREVIEW_DIR") {
+            let dest=std::path::PathBuf::from(dest);std::fs::create_dir_all(&dest).unwrap();
+            raster.buf.fill([0.08,0.08,0.09,1.0]);raster.draw(&h.ctx.tessellate(h.shapes.clone(),1.0),1.0);let mut rgba=Vec::new();raster.to_rgba8(&mut rgba);
+            image::save_buffer(dest.join(if enabled{"settings-on.png"}else{"settings-off.png"}),&rgba,780,1800,image::ColorType::Rgba8).unwrap();
+        }
+    }
+}
+
+#[test]
 fn clock_12h_formats_boundaries_and_persists() {
     let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
     let mut h=H::new();
@@ -7741,6 +7830,7 @@ fn shelf_menu_last_action_fits_inside_window_and_works(){
 #[test]
 fn calendar_add_button_does_not_overlap_the_battery_ring(){
     let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    for seconds in [false,true] {
     for (index,(day_number,date,period,twelve,battery,scale)) in [
         (6,"11月6日 周五",1,false,Some(76),2.0),
         (28,"11月28日 周六",1,true,Some(76),1.25),
@@ -7754,6 +7844,7 @@ fn calendar_add_button_does_not_overlap_the_battery_ring(){
     let mut h=H::new();
     h.app.settings.skin=crate::model::Skin::Cream;h.app.settings.island_shape=crate::model::IslandShape::Pill;
     h.app.settings.clock_period=period;h.app.settings.clock_12h=twelve;h.app.settings.pet=false;
+    h.app.settings.clock_seconds=seconds;
     let day=chrono::NaiveDate::from_ymd_opt(2026,11,day_number).unwrap();
     h.app.calendar.view.day=day;h.app.calendar.view.month=crate::calendar::month_start(day);h.app.calendar.view.loaded=Some(h.app.calendar.view.month);
     h.app.show_page(7);
@@ -7767,7 +7858,7 @@ fn calendar_add_button_does_not_overlap_the_battery_ring(){
         raster.update_textures(&output.textures_delta);shapes=output.shapes;
         raster.free_textures(&output.textures_delta);
     }
-    if let Some(path)=std::env::var_os("DAOZAI_CALENDAR_HEADER_PREVIEW").filter(|_|index==0) {
+    if let Some(path)=std::env::var_os("DAOZAI_CALENDAR_HEADER_PREVIEW").filter(|_|index==0&&!seconds) {
         raster.buf.fill([0.15,0.15,0.15,1.0]);raster.draw(&h.ctx.tessellate(shapes.clone(),2.0),2.0);
         let mut rgba=Vec::new();raster.to_rgba8(&mut rgba);
         let image=image::RgbaImage::from_raw((crate::app::CANVAS_W*2.0) as u32,(WIN_H*2.0) as u32,rgba).unwrap();
@@ -7784,6 +7875,7 @@ fn calendar_add_button_does_not_overlap_the_battery_ring(){
         let bounds=text.visual_bounding_rect();
         assert!(!button.expand(3.0).intersects(bounds),"新增按钮不能覆盖日期或时间：{}",text.galley.text());
         assert!(bounds.right()<h.app.content_origin(Rect::from_min_size(Pos2::ZERO,Vec2::new(WIN_W,WIN_H))).x+355.0,"日期与时间应留出右侧播放和设置按钮的位置");
+    }
     }
     }
 }
