@@ -8248,6 +8248,68 @@ fn quota_acceptance_relay_key_only_response_shows_balance_unavailable(){
 
 
 #[test]
+fn quota_acceptance_new_api_user_balance_is_visible(){
+    use crate::quota::{Provider,Account,relay};
+    let _guard=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());let mut h=H::new();
+    let snapshot=relay::parse_new_api_user(&serde_json::json!({"success":true,"data":{"quota":550000,"used_quota":1000000}}),&serde_json::json!({"success":true,"data":{"quota_per_unit":500000,"quota_display_type":"USD"}})).unwrap();
+    h.app.quota.config.accounts=vec![Account{id:"relay-user".into(),provider:Provider::NewApi,alias:"测试站点".into(),source:"https://relay.example".into(),slot:None,enabled:true,pinned:true}];
+    h.app.quota.config.selected="relay-user".into();h.app.quota.rows.insert("relay-user".into(),Ok(snapshot));h.app.show_page(6);h.hover(H::local(230.0,65.0),1.0);
+    assert!(h.shapes.iter().any(|s|matches!(&s.shape,egui::Shape::Text(t)if t.galley.text()=="1.1 USD")));
+    assert!(!h.shapes.iter().any(|s|matches!(&s.shape,egui::Shape::Text(t)if t.galley.text()=="余额暂不可查询")));
+}
+
+#[test]
+fn quota_new_api_user_connection_switches_without_reusing_api_key(){
+    fn draw(h:&mut H,raster:&mut crate::preview_raster::Raster,events:Vec<egui::Event>)->egui::FullOutput{
+        h.t+=0.2;let output=h.ctx.run(egui::RawInput{time:Some(h.t),screen_rect:Some(Rect::from_min_size(Pos2::ZERO,egui::vec2(780.0,850.0))),events,..Default::default()},|ctx|{egui::CentralPanel::default().show(ctx,|ui|h.app.quota_settings(ui));});
+        raster.update_textures(&output.textures_delta);output
+    }
+    let _guard=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    for dark in [true,false]{
+        let mut h=H::new();h.ctx.set_visuals(if dark{egui::Visuals::dark()}else{egui::Visuals::light()});
+        h.app.settings_open=true;h.app.quota.provider=crate::quota::Provider::NewApi;h.app.quota.connect_open=true;h.app.quota.source="https://relay.example/tenant".into();h.app.quota.api_key="synthetic-api-key".into();
+        let mut raster=crate::preview_raster::Raster::new(780,850);
+        let _=draw(&mut h,&mut raster,vec![]);let _=draw(&mut h,&mut raster,vec![]);let output=draw(&mut h,&mut raster,vec![]);
+        let pos=output.shapes.iter().find_map(|s|match &s.shape{egui::Shape::Text(t)if t.galley.text()=="用户 Token（账户余额）"=>Some(t.visual_bounding_rect().center()),_=>None}).expect("应提供用户 Token 连接入口");
+        let _=draw(&mut h,&mut raster,vec![egui::Event::PointerMoved(pos),egui::Event::PointerButton{pos,button:egui::PointerButton::Primary,pressed:true,modifiers:Default::default()}]);
+        let _=draw(&mut h,&mut raster,vec![egui::Event::PointerButton{pos,button:egui::PointerButton::Primary,pressed:false,modifiers:Default::default()}]);
+        assert!(h.app.quota.relay_user_token);assert!(h.app.quota.api_key.is_empty());assert_eq!(h.app.quota.source,"https://relay.example/tenant");
+        h.app.quota.relay_user_id="42".into();h.app.quota.api_key="synthetic-user-access-token".into();
+        let _=draw(&mut h,&mut raster,vec![]);let output=draw(&mut h,&mut raster,vec![]);
+        assert!(output.shapes.iter().any(|s|matches!(&s.shape,egui::Shape::Text(t)if t.galley.text()=="用户 ID")));
+        assert!(!output.shapes.iter().any(|s|matches!(&s.shape,egui::Shape::Text(t)if t.galley.text().contains("synthetic-user-access-token"))));
+        if let Some(dest)=std::env::var_os("DAOZAI_NEW_API_PREVIEW"){
+            raster.draw(&h.ctx.tessellate(output.shapes,output.pixels_per_point),output.pixels_per_point);let mut rgba=Vec::new();raster.to_rgba8(&mut rgba);
+            let path=std::path::PathBuf::from(dest);std::fs::create_dir_all(&path).unwrap();image::save_buffer(path.join(if dark{"new-api-user-dark.png"}else{"new-api-user-light.png"}),&rgba,780,850,image::ColorType::Rgba8).unwrap();
+        }
+        h.app.quota_close_connection();assert!(h.app.quota.api_key.is_empty()&&h.app.quota.relay_user_id.is_empty());assert!(!h.app.quota.relay_user_token);
+    }
+}
+
+#[test]
+fn quota_cc_switch_general_and_custom_connections_render_in_both_themes(){
+    use crate::quota::{Provider,relay};
+    let _guard=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    for provider in [Provider::RelayGeneral,Provider::RelayCustom]{for dark in [true,false]{
+        let mut h=H::new();h.ctx.set_visuals(if dark{egui::Visuals::dark()}else{egui::Visuals::light()});
+        h.app.settings_open=true;h.app.quota.connect_open=true;h.app.quota.provider=provider;h.app.quota.relay_manual=true;h.app.quota.alias="我的中转站".into();h.app.quota.source="https://relay.example".into();h.app.quota.api_key="synthetic-private-key".into();h.app.quota.relay_script=relay::script::DEFAULT_SCRIPT.into();
+        let mut raster=crate::preview_raster::Raster::new(780,850);
+        for frame in 0..4{
+            let output=h.ctx.run(egui::RawInput{screen_rect:Some(Rect::from_min_size(Pos2::ZERO,egui::vec2(780.0,850.0))),..Default::default()},|ctx|{egui::CentralPanel::default().show(ctx,|ui|h.app.quota_settings(ui));});raster.update_textures(&output.textures_delta);
+            if frame==3{
+                let texts:Vec<_>=output.shapes.iter().filter_map(|s|match &s.shape{egui::Shape::Text(t)=>Some(t.galley.text()),_=>None}).collect();let has_button=texts.contains(&"验证并连接");assert!(!texts.iter().any(|s|s.contains("synthetic-private-key")));
+                if provider==Provider::RelayCustom{assert!(texts.contains(&"查询脚本"));}
+                if let Some(dest)=std::env::var_os("DAOZAI_CC_SWITCH_PREVIEW"){
+                    raster.draw(&h.ctx.tessellate(output.shapes,output.pixels_per_point),output.pixels_per_point);let mut rgba=Vec::new();raster.to_rgba8(&mut rgba);let path=std::path::PathBuf::from(dest);std::fs::create_dir_all(&path).unwrap();image::save_buffer(path.join(format!("{}-{}.png",if provider==Provider::RelayCustom{"custom"}else{"general"},if dark{"dark"}else{"light"})),&rgba,780,850,image::ColorType::Rgba8).unwrap();
+                }
+                assert!(has_button,"{provider:?} 连接按钮应可见");
+            }
+        }
+        h.app.quota_close_connection();assert!(h.app.quota.relay_script.is_empty()&&h.app.quota.api_key.is_empty());
+    }}
+}
+
+#[test]
 fn quota_acceptance_grouped_connections_preserve_saved_sources() {
     use crate::quota::{Provider,Account};
     let _guard=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
