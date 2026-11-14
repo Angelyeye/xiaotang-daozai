@@ -57,6 +57,23 @@ pub const WIN_H: f32 = 270.0;
 pub const PILL_GAP: f32 = 6.0;
 
 /// 胶囊的柔和投影：四周都有，多层叠加近似高斯。
+/// 圆角矩形一圈轮廓点（顺时针、首尾闭合），用于沿胶囊外形逐段着色。
+fn round_rect_points(r:Rect,radius:f32)->Vec<Pos2>{
+    let radius=radius.min(r.width().min(r.height())*0.5).max(0.0);
+    let corners=[
+        (Pos2::new(r.right()-radius,r.top()+radius),-90.0f32),
+        (Pos2::new(r.right()-radius,r.bottom()-radius),0.0),
+        (Pos2::new(r.left()+radius,r.bottom()-radius),90.0),
+        (Pos2::new(r.left()+radius,r.top()+radius),180.0),
+    ];
+    let mut points=Vec::with_capacity(4*9+1);
+    for (c,a0) in corners {
+        for i in 0..=8 {let a=(a0+90.0*i as f32/8.0).to_radians();points.push(c+Vec2::new(a.cos(),a.sin())*radius);}
+    }
+    points.push(points[0]);
+    points
+}
+
 fn pill_shadow(painter:&egui::Painter,rect:Rect,radius:f32,strength:f32){
     if strength<=0.01 {return;}
     for (grow,a) in [(10.0f32,0.035f32),(6.5,0.05),(3.5,0.07),(1.5,0.09)] {
@@ -621,6 +638,14 @@ const STRETCH_MAX: f32 = 0.22;
 const STRETCH_SPEED: f32 = 1400.0;
 /// 吸附范围（`island_offset` 单位）：居中和拖动前的位置。
 const DRAG_MAGNET: f32 = 5.0;
+/// 吸住居中后要拖出更远才松开，停在中间时稳稳「咬住」，不会被手抖带走。
+const CENTER_RELEASE: f32 = 9.0;
+/// 离居中多近开始浮现轮廓描边（`island_offset` 单位）。
+const CENTER_GUIDE_RANGE: f32 = 24.0;
+/// 吸附瞬间沿轮廓从中心向两端扫开的光，持续时长（秒）。
+const CENTER_SWEEP: f64 = 0.55;
+/// 已居中的提示色（绿）：岛体描边、外发光和扫光统一用它，颜色本身就是「对准了」。
+const CENTER_TINT: (f32, f32, f32) = (88.0, 222.0, 140.0);
 
 pub struct App {
     pub opts: Options,
@@ -646,6 +671,12 @@ pub struct App {
     /// 拿起程度 0..1（可略过冲）与速度拉伸量，只影响岛体外形，不影响展开进度。
     drag_lift: anim::Spring,
     drag_stretch: anim::Spring,
+    /// 拖动时是否吸在居中；进入吸附的时刻用于触发扫光和「咔嗒」。
+    pub(crate) center_locked: bool,
+    center_lock_at: f64,
+    /// 居中描边可见度 0..1（越靠近居中越清晰）与「已居中」点亮程度 0..1。
+    pub(crate) center_guide: f32,
+    pub(crate) center_lock_a: f32,
     /// 光标停在日期时间拖动区的起始时间：停留越久把手提示越明显，划过不打扰。
     grip_hover_since: Option<f64>,
 
@@ -834,6 +865,10 @@ impl App {
             drag_glide: None,
             drag_lift: anim::Spring::new(0.0, LIFT_K.0, LIFT_K.1),
             drag_stretch: anim::Spring::new(0.0, 260.0, 0.6),
+            center_locked: false,
+            center_lock_at: -10.0,
+            center_guide: 0.0,
+            center_lock_a: 0.0,
             grip_hover_since: None,
             page: initial_page,
             page_from: initial_page,
@@ -1902,6 +1937,7 @@ impl App {
         }
         self.paint_body(&painter, body, flare, flare_h, radius, feather);
         if lifted > 0.01 {self.paint_lift_halo(&painter, body, flare, flare_h, radius, lifted.min(1.0));}
+        let center_guide=self.paint_center_rim(&painter, body, panel, flare, flare_h, radius, env.screen);
         let content_from=crate::skin_paint::shape_count(&ctx,layer);
 
         // 内容只随形体「揭开」：不缩放，按面板裁剪，到 55% 才开始淡入
@@ -2024,6 +2060,7 @@ impl App {
         };
         // 拿起放大、甩动拉伸以及加深的投影都要留在窗口区域内，否则两端会被系统裁掉。
         if self.drag_lift.pos.abs()>0.005 || self.drag_stretch.pos.abs()>0.001 {region=region.union(panel.expand2(Vec2::new(18.0,22.0)));}
+        if let Some(r)=center_guide {region=region.union(r);}
         if let Some(r)=messenger_rect{region=region.union(r.expand(5.0));}
         if let Some(rect)=notice_shape {region=region.union(rect.expand2(Vec2::new(12.0,8.0)));}
         if let Some(rect)=notice_details {region=region.union(rect.expand(12.0));}
@@ -2063,6 +2100,7 @@ impl App {
         });
         self.update_position_drag(&ctx,env,dt);
         let transitioning = self.position_drag.is_some() || self.drag_glide.is_some() || !self.drag_lift.settled(1.0) || !self.drag_stretch.settled(1.0) || !self.w.settled(PW)
+            || self.center_guide>0.002 || self.center_lock_a>0.002 || self.t-self.center_lock_at<CENTER_SWEEP
             || !self.h.settled(self.expanded_height())
             || self.page_e() < 0.7
             || self.dots.iter().any(|d| !d.settled(16.0))
@@ -2421,8 +2459,15 @@ impl App {
                     else {drag.offset+(position-start)/travel*limit};
                 let raw=raw.clamp(-limit,limit);
                 // 居中和拖动前的位置有轻微吸附，窗口弹簧会把这一下「吸过去」。
+                // 居中带滞回：进入范围小、松开范围大；刚吸住时岛体轻轻一沉，像卡进了槽位。
+                let centered=raw.abs()<=if self.center_locked {CENTER_RELEASE}else{DRAG_MAGNET};
+                if centered && !self.center_locked {
+                    self.center_lock_at=self.t;
+                    self.drag_lift.vel-=2.8;
+                }
+                self.center_locked=centered;
                 let original=Some(drag.original.1 as f32).filter(|_|self.dock()==drag.original.0);
-                let target=[Some(0.0),original].into_iter().flatten().find(|p|(raw-p).abs()<=DRAG_MAGNET).unwrap_or(raw);
+                let target=if centered {0.0}else{original.filter(|p|(raw-p).abs()<=DRAG_MAGNET).unwrap_or(raw)};
                 self.settings.island_offset=target.round() as i32;
                 let glide=self.drag_glide.get_or_insert_with(||anim::Spring::new(drag.offset,GLIDE_FOLLOW.0,GLIDE_FOLLOW.1));
                 glide.target=target;
@@ -2457,6 +2502,94 @@ impl App {
             glide.step(dt);
             if self.position_drag.is_none() && glide.settled(limit) {self.drag_glide=None;}
         }
+        // 描边：拖动中按离居中的距离渐显；松手后稍作停留再淡出，让人确认落在了中间。
+        let dragging=self.position_drag.is_some();
+        let distance=self.drag_glide.map_or(f32::INFINITY,|g|g.pos.abs());
+        let want=if dragging {1.0-smoothstep(1.5,CENTER_GUIDE_RANGE,distance)}else{0.0};
+        self.center_guide=anim::approach(self.center_guide,want,if dragging {18.0}else{5.0},dt);
+        let lit=self.center_locked && (dragging || self.center_guide>0.05);
+        self.center_lock_a=anim::approach(self.center_lock_a,if lit {1.0}else{0.0},16.0,dt);
+        if !dragging && self.center_guide<0.002 {self.center_locked=false;}
+    }
+
+    /// 拖动接近居中时由岛体轮廓和一根中轴细线提示，不用文字：
+    /// 越靠近居中，轮廓浮出越清晰的淡白描边，屏幕中轴细线与岛体中心刻度逐渐重合；
+    /// 吸住瞬间描边和细线一起转为绿色、一道亮光从中心沿轮廓向两端扫开，停在中间期间绿边缓慢呼吸。
+    /// 返回需要留在窗口区域内的范围。
+    fn paint_center_rim(&self,painter:&egui::Painter,body:Rect,panel:Rect,flare:f32,flare_h:f32,radius:f32,screen:Option<Rect>)->Option<Rect> {
+        let sweep=((self.t-self.center_lock_at)/CENTER_SWEEP) as f32;
+        let sweeping=(0.0..1.0).contains(&sweep);
+        let vis=self.center_guide;
+        if (vis<0.004 && !sweeping) || body.width()<10.0 || body.height()<10.0 {return None;}
+        let dock=self.dock();
+        let side=dock.is_side();
+        let along=if side {Vec2::Y}else{Vec2::X};
+        let pill=self.settings.island_shape==model::IslandShape::Pill;
+        let outline=|grow:f32| if pill {round_rect_points(body.expand(grow),radius+grow)}
+            else if side {shape::outline_docked(body.expand(grow),dock,flare,flare_h,radius+grow)}
+            else {shape::outline(body.expand(grow),flare,flare_h,radius+grow)};
+        // 颜色即状态：接近时中性白，吸住后过渡为绿色。
+        let tint=|mix:f32,alpha:f32| {
+            let c=|w:f32,a:f32|(lerp(w,a,mix)) as u8;
+            Color32::from_rgba_unmultiplied(c(255.0,CENTER_TINT.0),c(255.0,CENTER_TINT.1),c(255.0,CENTER_TINT.2),(alpha.clamp(0.0,1.0)*255.0) as u8)
+        };
+        let lock=self.center_lock_a;
+        let points=outline(0.5);
+        if vis>0.004 {
+            // 停在中间时绿边以 1.6 秒为周期缓慢呼吸，持续表明「就在中间」。
+            let breathe=0.5+0.5*((self.t*std::f64::consts::TAU/1.6).sin() as f32);
+            let strength=vis*lerp(0.32,lerp(0.78,1.0,breathe),lock);
+            if lock>0.01 {painter.add(egui::Shape::line(outline(2.0),egui::Stroke::new(5.0,tint(1.0,0.22*strength*lock))));}
+            painter.add(egui::Shape::line(points.clone(),egui::Stroke::new(lerp(1.0,1.6,lock),tint(lock,0.95*strength))));
+        }
+        let mut bounds=body.expand(8.0);
+        // 中轴细线：屏幕中轴一条向外渐隐的细线，岛体中心一截短刻度，两者重合即居中；吸住后细线同样转绿。
+        // 细线画在桌面上，底色未知：彩芯加淡黑描边，深浅壁纸都看得清。
+        if let Some(screen)=screen.filter(|_|vis>0.004) {
+            let travel=if side {screen.height()/2.0-crate::side_dock::SIDE_HALF_EXTENT}else{screen.width()/2.0-crate::display_layout::ISLAND_HALF_EXTENT}.max(0.0);
+            // 屏幕中轴相对岛体中心的位置（与窗口跟随同源，不会差一帧）。
+            let off=self.placement_offset()*travel;
+            let (out,edge)=match dock {
+                model::Dock::Top=>(Vec2::Y,Pos2::new(panel.center().x,panel.bottom())),
+                model::Dock::Left=>(Vec2::X,Pos2::new(panel.right(),panel.center().y)),
+                model::Dock::Right=>(-Vec2::X,Pos2::new(panel.left(),panel.center().y)),
+            };
+            let start=edge+out*6.0;
+            let axis=start-along*off;
+            let length=lerp(24.0,32.0,lock);
+            let line=|from:Pos2,len:f32,strength:f32,width:f32,mix:f32| {
+                const N:usize=12;
+                for i in 0..N {
+                    let (a,b)=(i as f32/N as f32,(i+1) as f32/N as f32);
+                    let fade=(1.0-(a+b)*0.5).powf(1.3)*strength;
+                    if fade<0.004 {continue;}
+                    let (p,q)=(from+out*len*a,from+out*len*b);
+                    painter.line_segment([p,q],egui::Stroke::new(width+2.0,Color32::from_black_alpha((40.0*fade) as u8)));
+                    if mix>0.01 {painter.line_segment([p,q],egui::Stroke::new(width+3.0,tint(1.0,0.10*fade*mix)));}
+                    painter.line_segment([p,q],egui::Stroke::new(width,tint(mix,0.80*fade)));
+                }
+            };
+            // 细线只做辅助：比描边更短更淡，吸住后也只转成偏浅的绿。
+            line(axis,length,vis*lerp(0.40,0.70,lock),lerp(1.0,1.3,lock),lock*0.7);
+            if off.abs()>0.5 {line(start,8.0,vis*0.65*(1.0-lock),1.0,0.0);}
+            bounds=bounds.union(Rect::from_two_pos(start,axis+out*length).expand(6.0));
+        }
+        // 扫光：吸住瞬间从岛体中心沿轮廓向两端对称扫开，扫到两端时淡尽。
+        if sweeping {
+            let half=if side {body.height()}else{body.width()}*0.5;
+            let front=anim::ease_out_cubic(sweep)*(half+12.0);
+            let fade=(1.0-sweep).powf(1.2);
+            let mid=body.center();
+            for pair in points.windows(2) {
+                let m=pair[0]+(pair[1]-pair[0])*0.5;
+                let d=(m-mid).dot(along).abs();
+                let g=(-((d-front)/18.0).powi(2)).exp()*fade;
+                if g<0.01 {continue;}
+                painter.line_segment([pair[0],pair[1]],egui::Stroke::new(6.0,tint(1.0,0.30*g)));
+                painter.line_segment([pair[0],pair[1]],egui::Stroke::new(1.8,tint(0.45,0.95*g)));
+            }
+        }
+        Some(bounds)
     }
 
     /// 拖动中和落位期间窗口使用的位置（-1 … 1，不取整）；其余时候就是保存的位置。
@@ -2479,6 +2612,8 @@ impl App {
         let mut glide=anim::Spring::new(offset as f32,GLIDE_FOLLOW.0,GLIDE_FOLLOW.1);
         if let Some(g)=self.drag_glide {glide.pos=g.pos;glide.vel=g.vel;}
         self.drag_glide=Some(glide);
+        // 本来就在中间：直接显示已居中，不重复扫光。
+        self.center_locked=offset==0;
         // 拿起时给一点初速度，按下后立刻有反馈。
         self.drag_lift.vel=self.drag_lift.vel.max(4.0);
     }

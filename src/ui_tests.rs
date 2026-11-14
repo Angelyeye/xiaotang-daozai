@@ -1303,10 +1303,18 @@ fn island_position_drag_lifts_on_hold_glides_smoothly_and_snaps_to_center(){
     for _ in 0..40{island_drag_frame(&mut h,bounds,1.0,Some(to(-10.0)),None);}
     assert!((h.app.placement_offset()+0.10).abs()<0.003,"持有后应追上光标");
     // 居中附近吸附，离开吸附范围后恢复跟随。
+    assert!(h.app.center_guide>0.2 && h.app.center_guide<0.9 && h.app.center_lock_a<0.05,"接近居中时准线渐显，但还没点亮：{}",h.app.center_guide);
     island_drag_frame(&mut h,bounds,1.0,Some(to(2.0)),None);
     assert_eq!(h.app.settings.island_offset,0,"靠近居中应吸附");
+    assert!(h.app.center_locked,"吸附后应标记为已居中");
+    for _ in 0..30{island_drag_frame(&mut h,bounds,1.0,Some(to(2.0)),None);}
+    assert!(h.app.center_guide>0.9 && h.app.center_lock_a>0.9,"居中时准线应清晰可见并切换为已居中配色");
+    // 吸住后有滞回：稍微拖出一点仍停在中间，拖得更远才松开。
     island_drag_frame(&mut h,bounds,1.0,Some(to(7.0)),None);
-    assert_eq!(h.app.settings.island_offset,7);
+    assert_eq!(h.app.settings.island_offset,0,"居中后轻微偏移不应松开");
+    island_drag_frame(&mut h,bounds,1.0,Some(to(12.0)),None);
+    assert_eq!(h.app.settings.island_offset,12);
+    assert!(!h.app.center_locked);
     island_drag_frame(&mut h,bounds,1.0,Some(to(-28.5)),None);
     assert_eq!(h.app.settings.island_offset,-30,"靠近原位置应吸附回去");
     island_drag_frame(&mut h,bounds,1.0,Some(to(2.0)),None);
