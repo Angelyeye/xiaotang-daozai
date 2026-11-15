@@ -260,15 +260,6 @@ impl Default for Runtime {
         .filter(|client|client.adapter().native.taskbar.is_some()).map(|client|TaskbarEntry{client,source:None,retry:None,status:String::new()}).collect()}}
 }
 impl Runtime {
-    /// 点开时补绑的账号要进运行时账本：否则后面「前台确认」会把 QQ 当未知账号，拒绝收掉提醒。
-    /// 只有线上恰好一个账号时才算绑定成功，返回绑到的那个账号。
-    pub fn adopt_single_account(&mut self,source:Messenger)->Option<Unread>{
-        let discover=source.adapter().native.accounts?;
-        let accounts=discover(&client_paths(source))?;
-        let [account]=accounts.as_slice() else{return None};
-        self.track_unread(account.unread).ok()?;
-        Some(account.unread)
-    }
     pub fn foreground(&self,sources:&[Messenger])->Option<(Messenger,u32)>{
         let (client,pid)=foreground_client(sources)?;
         let pid=if client==Messenger::Qq{
@@ -376,6 +367,7 @@ pub struct OpenRequest {unread:Unread,target:Option<Target>,allow_tray:bool}
 static OPEN:crate::resources::Lane=crate::resources::Lane::new("daozai-messenger-open",1);
 impl OpenRequest {
     pub fn start(self,ctx:eframe::egui::Context)->Result<mpsc::Receiver<Result<(),OpenError>>,OpenError>{
+        if self.unread.unidentified(){return Err(OpenError::Unidentified);}
         let lease=OPEN.acquire().ok_or(OpenError::Busy)?;let (tx,rx)=mpsc::channel();
         lease.spawn(move||{let _=tx.send(self.run());ctx.request_repaint();}).ok_or(OpenError::Unavailable)?;
         Ok(rx)
@@ -383,33 +375,17 @@ impl OpenRequest {
     fn run(self)->Result<(),OpenError>{self.run_with_paths(&client_paths(self.unread.source))}
     pub(crate) fn run_with_paths(self,paths:&[String])->Result<(),OpenError>{
         use windows::Win32::{Foundation::WAIT_OBJECT_0,System::Threading::WaitForSingleObject};
-        let (unread,target)=match self.target{
-            Some(target)=>{
-                if target.unread!=self.unread{return Err(OpenError::Unavailable);}
-                (self.unread,target)
-            }
-            // 通知到达时没能绑定账号（群聊消息常见）时，点开这一刻按当前唯一在线的账号补绑。
-            None=>{
-                if Runtime::default().exited_with(&[self.unread],client_processes).contains(&self.unread){return Err(OpenError::Exited);}
-                if self.unread.pid!=0{return Err(OpenError::Unavailable);}
-                let target=single_account_target(self.unread.source,paths)?;
-                (target.unread,target)
-            }
+        let Some(target)=self.target else{
+            validate_unread_with(self.unread,client_processes)?;
+            return Err(if self.unread.pid==0{OpenError::Unidentified}else{OpenError::Unavailable});
         };
+        if target.unread!=self.unread{return Err(OpenError::Unavailable);}
         // 句柄保留到整个唤起结束，不能因提醒被关闭而提前允许进程号复用。
-        let process=check_target(target)?;let adapter=unread.source.adapter().native;
+        let process=check_target(target)?;let adapter=self.unread.source.adapter().native;
         if !(adapter.ready)(target){return Err(OpenError::Unavailable);}
-        let result=(adapter.open)(unread,paths,self.allow_tray);
+        let result=(adapter.open)(self.unread,paths,self.allow_tray);
         if unsafe{WaitForSingleObject(*process,0)==WAIT_OBJECT_0}{Err(OpenError::Exited)}else{result}
     }
-}
-/// 补绑只接受唯一在线账号：多开时无法判断提醒属于谁，仍按未识别处理。
-fn single_account_target(source:Messenger,paths:&[String])->Result<Target,OpenError>{
-    let accounts=(source.adapter().native.accounts).ok_or(OpenError::Unidentified)?(paths).ok_or(OpenError::Unidentified)?;
-    let [account]=accounts.as_slice() else{return Err(OpenError::Unidentified);};
-    let mut runtime=Runtime::default();
-    runtime.track_unread(account.unread)?;
-    runtime.targets.get(&account.unread).copied().ok_or(OpenError::Unidentified)
 }
 fn validate_unread_with(unread:Unread,discover:impl FnMut(Messenger)->Option<Vec<u32>>)->Result<(),OpenError>{
     if Runtime::default().exited_with(&[unread],discover).contains(&unread){return Err(OpenError::Exited);}
@@ -533,6 +509,20 @@ mod tests {
         fn drop(&mut self){let _=self.0.kill();let _=self.0.wait();}
     }
     fn qq_target(pid:u32)->Target{Target{unread:crate::app::Unread{source:crate::app::Messenger::Qq,pid,window:pid as isize},started:u64::from(pid)}}
+    #[test]
+    fn qq_open_regression_unknown_click_after_an_account_exits(){
+        let (a,b)=(qq_target(100),qq_target(200));
+        let mut history=AccountHistory::new(Messenger::Qq);
+        history.observe(10,Some(vec![a,b]));
+        history.observe(20,Some(vec![a,b]));
+        assert_eq!(history.target(1,15,|_|true),None);
+        let unknown=Unread::of(Messenger::Qq);
+        let mut runtime=Runtime::default();
+        history.observe(30,Some(vec![b]));
+        assert!(runtime.exited_with(&[unknown],|_|Some(vec![b.unread.pid])).is_empty());
+        let click=runtime.request(unknown,&Settings::default()).start(Default::default());
+        assert!(matches!(click,Err(OpenError::Unidentified)),"旧提醒不能启动唤起剩余账号的后台任务");
+    }
     #[test]
     fn qq_notifications_bind_only_to_the_stable_account_at_creation(){
         let a=qq_target(100);let mut accounts=AccountHistory::new(Messenger::Qq);

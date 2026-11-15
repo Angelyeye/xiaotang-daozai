@@ -168,22 +168,4 @@ mod tests{
         }
     }
 
-    #[test]
-    #[ignore="需要本机正在运行 QQ，仅用于现场验证 pid=0 的 QQ 提醒能否补绑并唤起"]
-    fn live_open_unidentified_qq(){
-        let paths=paths();
-        let unread=crate::app::Unread::of(crate::app::Messenger::Qq);
-        let result=crate::messenger::windows::open_unread_with_paths(unread,&paths);
-        println!("pid=0 的 QQ 提醒打开结果 = {result:?}");
-        assert!(result.is_ok(),"应当能补绑到唯一 QQ 账号并唤起");
-    }
-
-    #[test]
-    #[ignore="需要本机正在运行 QQ，仅用于现场验证补绑账号能进运行时账本"]
-    fn live_adopt_single_account(){
-        let mut runtime=crate::messenger::Runtime::default();
-        let bound=runtime.adopt_single_account(crate::app::Messenger::Qq);
-        println!("adopt_single_account = {bound:?}");
-        assert!(bound.is_some(),"应当能把唯一在线 QQ 账号记进账本");
-    }
 }
