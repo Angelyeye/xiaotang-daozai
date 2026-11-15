@@ -387,7 +387,9 @@ pub struct OpenRequest {unread:Unread,target:Option<Target>,allow_tray:bool}
 static OPEN:crate::resources::Lane=crate::resources::Lane::new("daozai-messenger-open",1);
 impl OpenRequest {
     pub fn start(self,ctx:eframe::egui::Context)->Result<mpsc::Receiver<Result<(),OpenError>>,OpenError>{
-        let lease=OPEN.acquire().ok_or(OpenError::Busy)?;let (tx,rx)=mpsc::channel();
+        let lease=OPEN.acquire().ok_or(OpenError::Busy)?;
+        if self.unread.unidentified(){return Err(OpenError::Unidentified);}
+        let (tx,rx)=mpsc::channel();
         lease.spawn(move||{let _=tx.send(self.run());ctx.request_repaint();}).ok_or(OpenError::Unavailable)?;
         Ok(rx)
     }
@@ -543,6 +545,20 @@ mod tests {
         fn drop(&mut self){let _=self.0.kill();let _=self.0.wait();}
     }
     fn qq_target(pid:u32)->Target{Target{unread:crate::app::Unread{source:crate::app::Messenger::Qq,pid,window:pid as isize},started:u64::from(pid)}}
+    #[test]
+    fn qq_open_regression_unknown_click_after_an_account_exits(){
+        let (a,b)=(qq_target(100),qq_target(200));
+        let mut history=AccountHistory::new(Messenger::Qq);
+        history.observe(10,Some(vec![a,b]));
+        history.observe(20,Some(vec![a,b]));
+        assert_eq!(history.target(1,15,|_|true),None);
+        let unknown=Unread::of(Messenger::Qq);
+        let mut runtime=Runtime::default();
+        history.observe(30,Some(vec![b]));
+        assert!(runtime.exited_with(&[unknown],|_|Some(vec![b.unread.pid])).is_empty());
+        let click=runtime.request(unknown,&Settings::default()).start(Default::default());
+        assert!(matches!(click,Err(OpenError::Unidentified)),"旧提醒不能启动唤起剩余账号的后台任务");
+    }
     #[test]
     fn qq_notifications_bind_only_to_the_stable_account_at_creation(){
         let a=qq_target(100);let mut accounts=AccountHistory::new(Messenger::Qq);

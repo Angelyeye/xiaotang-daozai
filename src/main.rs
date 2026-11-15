@@ -109,6 +109,19 @@ impl Shell {
     }
 
     #[cfg(windows)]
+    fn confirm_messenger_open(&mut self,unread:app::Unread)->bool{
+        let foreground=self.messengers.foreground(&[unread.source]);
+        if !self.app.confirm_messenger_open(unread,foreground){
+            let seen=foreground.map(|(source,pid)|format!("{} 账号 {pid}",source.name())).unwrap_or_else(messenger::windows::describe_foreground);
+            messenger::windows::trace(format!("唤起 {} 账号 {}：未到前台（前台是 {seen}）",unread.source.name(),unread.pid));
+            return false;
+        }
+        messenger::windows::trace(format!("唤起 {} 账号 {}：已在前台",unread.source.name(),unread.pid));
+        self.messengers.viewed_client(unread.source,unread.pid);
+        true
+    }
+
+    #[cfg(windows)]
     fn clear_exited_messengers(&mut self,ctx:&egui::Context){
         for unread in self.messengers.exited(&self.app.pending_messengers){
             messenger::windows::trace(format!("清除已退出的{}提醒 账号 {}",unread.source.name(),unread.pid));
@@ -338,6 +351,7 @@ impl eframe::App for Shell {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let frame_start=Instant::now();
         if self.resource_at.ready(Duration::from_secs(30)){
             let (count,bytes)={let textures=ctx.tex_manager();let textures=textures.read();(textures.num_allocated(),textures.allocated().map(|(_,info)|info.bytes_used()).sum())};
             daozai::resources::TEXTURES.store(count,std::sync::atomic::Ordering::Relaxed);
@@ -494,7 +508,13 @@ impl eframe::App for Shell {
             if let Some((unread,rx))=&self.tray_opening {
                 let unread=*unread;
                 match rx.try_recv(){
-                    Ok(Ok(()))=>{self.tray_opening=None;self.opening_messenger=Some((unread,Instant::now()));ctx.request_repaint_after(Duration::from_secs(4));}
+                    Ok(Ok(()))=>{
+                        self.tray_opening=None;
+                        if !self.confirm_messenger_open(unread){
+                            self.opening_messenger=Some((unread,Instant::now()));
+                            ctx.request_repaint_after(Duration::from_secs(4));
+                        }
+                    }
                     Ok(Err(error))=>{
                         self.tray_opening=None;
                         if error==OpenError::Exited{self.app.discard_unread(unread);}
@@ -512,17 +532,8 @@ impl eframe::App for Shell {
                 if !self.app.pending_messengers.contains(&unread){self.opening_messenger=None;}
                 else if started.elapsed()>=Duration::from_secs(4){
                     self.opening_messenger=None;
-                    // 打开请求被接受不代表窗口真的出来了：4 秒后核对一次，结果记入唤起日志。
-                    match self.messengers.foreground(&[unread.source]){
-                        Some((source,pid)) if unread.pid==0||unread.pid==pid=>{
-                            messenger::windows::trace(format!("唤起 {} 账号 {}：4 秒后核对，已在前台",unread.source.name(),unread.pid));
-                            self.messengers.viewed_client(source,pid);self.app.viewed_client(source,pid);
-                        },
-                        other=>{
-                            let seen=other.map(|(source,pid)|format!("前台是 {} 的另一个账号 {pid}",source.name())).unwrap_or_else(||format!("前台是 {}",messenger::windows::describe_foreground()));
-                            messenger::windows::trace(format!("唤起 {} 账号 {}：4 秒后核对，未到前台（{seen}）",unread.source.name(),unread.pid));
-                            self.app.messenger_unavailable(format!("{}尚未切到前台，可点图标重试",unread.source.name()));
-                        }
+                    if !self.confirm_messenger_open(unread){
+                        self.app.messenger_unavailable(format!("{}尚未切到前台，可点图标重试",unread.source.name()));
                     }
                 }
             }
@@ -678,6 +689,7 @@ impl eframe::App for Shell {
                             Ok(rx)=>self.tray_opening=Some((unread,rx)),
                             Err(error)=>{
                                 messenger::windows::trace(format!("唤起 {} 账号 {}：未开始 {error:?}",unread.source.name(),unread.pid));
+                                if error==OpenError::Unidentified{self.app.reveal_messenger_notice(unread);}
                                 self.app.messenger_unavailable(error.message(unread.source));ctx.request_repaint();
                             }
                         }
@@ -780,6 +792,13 @@ impl eframe::App for Shell {
         #[cfg(windows)] let repaint_after=if self.hidden{Duration::from_secs(1)}else{out.repaint_after};
         #[cfg(not(windows))] let repaint_after=out.repaint_after;
         schedule_repaint(ctx,repaint_after);
+        // 只记慢帧：卡顿反馈时能直接看出是渲染慢还是输入被吞（页面/展开状态一并记下）。
+        let elapsed=frame_start.elapsed();
+        if elapsed>=Duration::from_millis(60) {
+            let (page,open)=self.app.debug_state();
+            daozai::resources::append_log(&daozai::model::config_dir().join("diagnostics"),"frames",
+                &format!("帧 {:.0} ms｜页面 {}｜展开 {}",elapsed.as_secs_f64()*1000.0,page,open));
+        }
     }
 }
 
