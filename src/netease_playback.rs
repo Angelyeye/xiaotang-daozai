@@ -285,7 +285,7 @@ fn cover_failure_can_retry_without_a_minute_of_blank_artwork(){
     assert!(cache.retry_at.unwrap().duration_since(before)<Duration::from_secs(5),"封面暂时失败后不能空白一分钟");
 }
 
-fn fetch_cover(url:&str)->Option<Arc<eframe::egui::ColorImage>>{
+pub(super) fn fetch_cover(url:&str)->Option<Arc<eframe::egui::ColorImage>>{
     let url=cover_url(url)?;
     let response=ureq::AgentBuilder::new().timeout(Duration::from_secs(5)).redirects(0).build().get(&url).call().ok()?;
     let limit=2*1024*1024;let mut bytes=Vec::new();

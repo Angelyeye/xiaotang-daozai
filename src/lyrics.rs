@@ -391,9 +391,55 @@ fn fetch_with_sources(netease:Option<&str>,qq:Option<&str>,lrclib:Option<&str>,t
     fetch_with_sources_detail(netease,qq,lrclib,track,artist,duration).0
 }
 
+/// 电台、DJ、部分网页播放器把「歌名 - 歌手」整个放进标题、歌手栏留空：拆成两半，只拆唯一的一个分隔符。
+pub(crate) fn split_title_artist(title:&str)->Option<(String,String)> {
+    for separator in [" - "," – "," — "] {
+        if title.matches(separator).count()!=1 {continue;}
+        let (left,right)=title.split_once(separator)?;
+        let (left,right)=(left.trim(),right.trim());
+        if !left.is_empty() && !right.is_empty() {return Some((left.to_owned(),right.to_owned()));}
+    }
+    None
+}
+
+/// 去掉开头的节目标注（【电台】、[DJ]）和结尾的版本标注（(DJ版)、（伴奏）、【现场】），只留歌名本体。
+pub(crate) fn bare_title(title:&str)->String {
+    static LEADING:std::sync::OnceLock<regex::Regex>=std::sync::OnceLock::new();
+    static TRAILING:std::sync::OnceLock<regex::Regex>=std::sync::OnceLock::new();
+    let leading=LEADING.get_or_init(||regex::Regex::new(r"^\s*(?:【[^】]*】|\[[^\]]*\])\s*").unwrap());
+    let trailing=TRAILING.get_or_init(||regex::Regex::new(r"\s*(?:\([^()]*\)|（[^（）]*）|\[[^\]]*\]|【[^】]*】)\s*$").unwrap());
+    let mut text=title.trim().to_owned();
+    loop {
+        let next=trailing.replace(&leading.replace(&text,""),"").trim().to_owned();
+        if next==text || next.is_empty() {return text;}
+        text=next;
+    }
+}
+
+/// 在线找词：先按播放器给的歌名、歌手找；落空时再按两种兜底各试一次——
+/// 歌手为空时从标题里拆出歌手（两种顺序），以及去掉节目 / 版本标注（只在有时长时，靠时长校验避免套错版本）。
+/// 有来源断网或限流时不再追加尝试，免得一首歌放大成多倍请求。
+fn fetch_with_sources_detail(netease:Option<&str>,qq:Option<&str>,lrclib:Option<&str>,track:&str,artist:&str,duration:f64)->(Result<Lyrics,FetchError>,bool) {
+    let mut attempts=vec![(track.to_owned(),artist.to_owned())];
+    if artist.trim().is_empty() {
+        if let Some((left,right))=split_title_artist(track) {attempts.push((left.clone(),right.clone()));attempts.push((right,left));}
+    }
+    let bare=bare_title(track);
+    if duration>0.0 && bare!=track.trim() {attempts.push((bare,artist.to_owned()));}
+    let mut best:Option<Result<Lyrics,FetchError>>=None;
+    for (index,(title,singer)) in attempts.into_iter().enumerate() {
+        if index>0 {trace(||format!("兜底:{title} - {}",if singer.is_empty(){"（无歌手）"}else{&singer}));}
+        let (result,failed)=fetch_with_sources_once(netease,qq,lrclib,&title,&singer,duration);
+        if failed || result.as_ref().is_ok_and(|lyrics|lyrics.synced) {return (result,failed);}
+        // 纯文本先留着，继续找同步版本；都没有时用第一份纯文本。
+        if best.as_ref().is_none_or(|kept|kept.is_err() && result.is_ok()) {best=Some(result);}
+    }
+    (best.unwrap_or(Err(FetchError::NotFound)),false)
+}
+
 /// 按顺序尝试，命中同步歌词立即停止；全部只有纯文本时取第一个，网络类错误优先于「未找到」上报以便重试。
 /// 第二个返回值表示是否有来源失败（断网、限流、响应异常），这时结果不能当作「确认没有」缓存。
-fn fetch_with_sources_detail(netease:Option<&str>,qq:Option<&str>,lrclib:Option<&str>,track:&str,artist:&str,duration:f64)->(Result<Lyrics,FetchError>,bool) {
+fn fetch_with_sources_once(netease:Option<&str>,qq:Option<&str>,lrclib:Option<&str>,track:&str,artist:&str,duration:f64)->(Result<Lyrics,FetchError>,bool) {
     let mut plain=None;
     let mut transliterated=None;
     let mut failure=None;
@@ -673,6 +719,17 @@ fn urlencode(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn radio_style_titles_are_split_and_stripped_conservatively(){
+        assert_eq!(split_title_artist("晴天 - 周杰伦"),Some(("晴天".into(),"周杰伦".into())));
+        assert_eq!(split_title_artist("周杰伦 – 晴天"),Some(("周杰伦".into(),"晴天".into())));
+        assert_eq!(split_title_artist("A - B - C"),None,"多个分隔符时不猜");
+        assert_eq!(split_title_artist("Re-Make"),None,"连字符不是分隔符");
+        assert_eq!(bare_title("【周末电台】晴天 (DJ版)"),"晴天");
+        assert_eq!(bare_title("遥远的她（Live）【现场】"),"遥远的她");
+        assert_eq!(bare_title("(没有歌名)"),"(没有歌名)","去掉后为空时保留原样");
+        assert_eq!(bare_title("晴天"),"晴天");
+    }
     #[test]
     fn resource_network_and_disk_lyrics_have_input_limits(){
         let oversized="x".repeat(2*1024*1024+1);

@@ -19,7 +19,8 @@ try {
         'resources.previous.log', 'last-resource-anomaly.log', 'resource-guard.log',
         'weather-network.log', 'weather-network.previous.log',
         'messenger-events.log', 'messenger-events.previous.log', 'wechat-events.log', 'wechat-tray.log',
-        'calendar.log', 'calendar.previous.log', 'lyrics.log', 'lyrics.previous.log', 'auto-restart.log')
+        'calendar.log', 'calendar.previous.log', 'lyrics.log', 'lyrics.previous.log',
+        'music-gaps.log', 'music-gaps.previous.log', 'auto-restart.log')
     foreach ($name in $logs + @('glass-diagnostics.txt')) {
         $source = if ($name -eq 'glass-diagnostics.txt') { Join-Path $DataDirectory $name } else { Join-Path (Join-Path $DataDirectory 'diagnostics') $name }
         if (!(Test-Path -LiteralPath $source -PathType Leaf)) { $missing.Add($name); continue }
@@ -129,16 +130,30 @@ public static class DaozaiDiagnosticWindows {
         $info.MediaSessions = @($manager.GetSessions() | ForEach-Object {
             $properties = Wait-WinRt ($_.TryGetMediaPropertiesAsync()) ([Windows.Media.Control.GlobalSystemMediaTransportControlsSessionMediaProperties])
             $playback = $_.GetPlaybackInfo()
+            $timeline = $_.GetTimelineProperties()
             [pscustomobject]@{ Source = $_.SourceAppUserModelId; Status = [string]$playback.PlaybackStatus; Type = [string]$playback.PlaybackType
-                HasTitle = [bool]($properties -and $properties.Title); HasArtist = [bool]($properties -and $properties.Artist) }
+                HasTitle = [bool]($properties -and $properties.Title); HasArtist = [bool]($properties -and $properties.Artist)
+                HasAlbum = [bool]($properties -and $properties.AlbumTitle); HasThumbnail = [bool]($properties -and $properties.Thumbnail)
+                HasDuration = [bool]($timeline -and $timeline.EndTime.Ticks -gt 0) }
         })
     } catch { $info.MediaQuery = '无法读取系统媒体会话' }
+    # 正在运行的音乐播放器与版本：播放器在放歌却没出现在上面的媒体会话里，就是「播放器没有向系统提供播放信息」。
+    try {
+        $info.MusicPlayers = @(Get-Process -Name cloudmusic, QQMusic, KuGou, SodaMusic, kwmusic, bodian_pc, Spotify, AppleMusic -ErrorAction SilentlyContinue |
+            Group-Object ProcessName | ForEach-Object {
+                $first = $_.Group | Select-Object -First 1
+                $item = [ordered]@{ Name = $_.Name; Processes = $_.Count }
+                try { $item.Version = $first.MainModule.FileVersionInfo.FileVersion; $item.Path = $first.Path } catch { $item.Details = '无法读取版本' }
+                [pscustomobject]$item
+            })
+    } catch { $info.MusicPlayerQuery = '无法读取音乐播放器进程' }
     Save-Text 'environment.json' ($info | ConvertTo-Json -Depth 7)
     New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
     $archive = Join-Path $OutputDirectory ('岛仔诊断-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N').Substring(0, 6) + '.zip')
     Compress-Archive -Path (Join-Path $collectionRoot '*') -DestinationPath $archive
     Write-Output ('诊断包已保存：' + $archive)
     Write-Output '请将诊断包发给开发者，并说明异常出现时间、重启岛仔能否恢复、是否发生在睡眠唤醒后。'
+    Write-Output '音乐没有歌名、封面或歌词时，请在歌曲播放中运行诊断，并说明使用的播放模式（歌单、电台、FM、漫游等）。'
     Write-Output '仅收集岛仔诊断日志、显示与功能开关、系统与显卡信息、消息客户端窗口类型和播放器状态；不读聊天内容和窗口标题，不会自动上传。'
 } finally {
     Get-ChildItem -LiteralPath $collectionRoot -File | ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force }
