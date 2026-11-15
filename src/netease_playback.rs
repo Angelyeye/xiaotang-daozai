@@ -253,9 +253,14 @@ impl Reader {
             let root=path.parent()?;
             // 大歌单的队列文件可达数十 MB：同一首歌且文件没有变化时不重复查找（这首歌本来就没有封面时会一直满足上面的条件）。
             let print=queue_fingerprint(root);
+            // 完整读过、确实没有这首歌（搜索、每日推荐等不在队列里的歌）也记下指纹：文件不变就不再整份重读，
+            // 否则大歌单下每 5 秒都要解析几十 MB。只有读取失败（被占用、写入中途）才清空指纹，稍后重试。
             if self.lookup.0!=id || self.queue_print!=print {
-                if let Some(metadata)=queue_track(root,id?){self.playback.metadata(metadata);self.queue_print=print;}
-                else{self.queue_print.clear();}
+                match queue_lookup(root,id?) {
+                    QueueLookup::Found(metadata)=>{self.playback.metadata(metadata);self.queue_print=print;}
+                    QueueLookup::Absent=>self.queue_print=print,
+                    QueueLookup::Unreadable=>self.queue_print.clear(),
+                }
             }
             self.lookup=(id,now);
         }
@@ -284,23 +289,38 @@ fn queue_fingerprint(root:&Path)->Vec<Option<(std::time::SystemTime,u64)>>{
 /// 队列文件只防异常：长期用户的「我喜欢」等大歌单可达上万首（约 2KB/首）。
 const QUEUE_LIMIT:u64=256*1024*1024;
 
-fn queue_track(root:&Path,id:u64)->Option<(NowPlaying,String)>{
-    let mut partial=None;
+/// 队列查找结果：找到（可能缺时长）、两个队列都完整读过且没有这首歌、或有队列暂时读不了。
+#[derive(Debug)]
+enum QueueLookup {Found((NowPlaying,String)),Absent,Unreadable}
+
+fn queue_lookup(root:&Path,id:u64)->QueueLookup{
+    let (mut partial,mut unreadable)=(None,false);
     for (file,key) in QUEUE_FILES{
-        let Some(found)=(||{
-            let file=File::open(root.join("webdata/file").join(file)).ok()?;
-            if file.metadata().ok()?.len()>QUEUE_LIMIT{crate::resources::REJECTED_DATA.fetch_add(1,std::sync::atomic::Ordering::Relaxed);return None;}
-            find_in_queue(std::io::BufReader::new(file),key,id)
-        })()else{continue;};
-        if found.0.duration>0.0{return Some(found);}
+        let found=(||{
+            let file=match File::open(root.join("webdata/file").join(file)){
+                Ok(file)=>file,
+                // 没有这个队列（比如从没用过私人 FM）不算读取失败。
+                Err(error) if error.kind()==std::io::ErrorKind::NotFound=>return Ok(None),
+                Err(_)=>return Err(()),
+            };
+            // 超过上限的文件不变就一直超限，按「没有」处理，不反复尝试。
+            if file.metadata().map_err(|_|())?.len()>QUEUE_LIMIT{crate::resources::REJECTED_DATA.fetch_add(1,std::sync::atomic::Ordering::Relaxed);return Ok(None);}
+            search_queue(std::io::BufReader::new(file),key,id)
+        })();
+        let found=match found {Ok(Some(found))=>found,Ok(None)=>continue,Err(())=>{unreadable=true;continue;}};
+        if found.0.duration>0.0{return QueueLookup::Found(found);}
         if partial.is_none(){partial=Some(found);}
     }
-    partial
+    match (partial,unreadable) {(Some(found),_)=>QueueLookup::Found(found),(None,true)=>QueueLookup::Unreadable,(None,false)=>QueueLookup::Absent}
 }
 
 /// 在 `{"<key>":[歌曲, …]}` 中逐首解析，找到第一首 ID 匹配的歌即停止：
 /// 内存只保留一首歌（约 2KB），不再把整个队列解析成 JSON 树。
-fn find_in_queue<R:Read>(reader:R,key:&str,id:u64)->Option<(NowPlaying,String)>{
+fn find_in_queue<R:Read>(reader:R,key:&str,id:u64)->Option<(NowPlaying,String)>{search_queue(reader,key,id).ok().flatten()}
+
+/// 与 `find_in_queue` 相同，但区分「完整读完、确实没有这首歌」（`Ok(None)`）
+/// 和「格式不符或写入中途截断」（`Err`）：前者文件不变就不必再查，后者要稍后重试。
+fn search_queue<R:Read>(reader:R,key:&str,id:u64)->Result<Option<(NowPlaying,String)>,()>{
     use serde::de::{Deserializer as _,DeserializeSeed,Error as _,IgnoredAny,MapAccess,SeqAccess,Visitor};
     const FOUND:&str="daozai:found";
     struct List<'a>{id:u64,found:&'a mut Option<(NowPlaying,String)>}
@@ -331,9 +351,10 @@ fn find_in_queue<R:Read>(reader:R,key:&str,id:u64)->Option<(NowPlaying,String)>{
         }
     }
     let mut found=None;
-    // 找到后以约定错误提前结束解析；其余错误（格式不符、写入中途截断）按未找到处理。
-    let _=serde_json::Deserializer::from_reader(reader).deserialize_map(Root{key,id,found:&mut found});
-    found
+    // 找到后以约定错误提前结束解析；其余错误（格式不符、写入中途截断）视为暂时读不了。
+    let result=serde_json::Deserializer::from_reader(reader).deserialize_map(Root{key,id,found:&mut found});
+    if found.is_some(){return Ok(found);}
+    result.map(|_|None).map_err(|_|())
 }
 
 fn process_id()->Option<u32>{
@@ -552,6 +573,20 @@ mod tests{
         let mut reader=Reader::default();assert_eq!(reader.read(&files.path,Some(9),2000).unwrap().duration,0.0);
         drop(lock);assert_eq!(before,queue_fingerprint(&files.root),"释放读取锁不会改变文件指纹");
         assert_eq!(reader.read(&files.path,Some(9),8000).unwrap().duration,240.0,"读取失败不能永久跳过未变化的队列");
+    }
+    #[test]
+    fn song_missing_from_an_unchanged_queue_is_not_reparsed_every_poll(){
+        // 搜索、每日推荐的歌不在播放队列里：完整读过一次后，文件不变就不能每 5 秒再整份解析一遍。
+        let files=QueueFixture::new("absent");let mut other=incomplete_track(456);other["duration"]=240000.into();
+        files.queue("playingList","list",serde_json::json!([other]));files.log(incomplete_track(123));
+        let mut reader=Reader::default();assert_eq!(reader.read(&files.path,Some(9),2000).unwrap().duration,0.0);
+        assert_eq!(reader.queue_print,queue_fingerprint(&files.root),"确实没有这首歌时记下队列指纹");
+        assert!(matches!(queue_lookup(&files.root,123),QueueLookup::Absent));
+        let mut found=incomplete_track(123);found["duration"]=180000.into();
+        files.queue("playingList","list",serde_json::json!([other,found]));
+        assert_eq!(reader.read(&files.path,Some(9),8000).unwrap().duration,180.0,"队列变化后照常重新查找");
+        std::fs::write(files.root.join("webdata/file/playingList"),b"{\"list\":[{\"track\":").unwrap();
+        assert!(matches!(queue_lookup(&files.root,123),QueueLookup::Unreadable),"写入中途截断视为暂时读不了，需要重试");
     }
     #[test]
     fn native_queue_prefers_a_known_duration_and_never_uses_another_song(){
