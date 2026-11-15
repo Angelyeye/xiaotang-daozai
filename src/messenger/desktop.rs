@@ -33,6 +33,7 @@ pub(crate) unsafe fn main_window(window:HWND,client:Messenger)->bool{
     if !IsWindow(window).as_bool() || GetWindow(window,GW_OWNER).is_ok()
         || !client_main_frame(client,&class_name(window),GetWindowLongW(window,GWL_STYLE)as u32,GetWindowLongW(window,GWL_EXSTYLE)as u32){return false;}
     if client==Messenger::DingTalk && class_name(window)!=DINGTALK_FRAME && has_dingtalk_frame(window_pid(window)){return false;}
+    if client==Messenger::Feishu && !feishu_title(&window_title(window)) && feishu_main_frame(window_pid(window)).is_some(){return false;}
     if IsIconic(window).as_bool(){return true;}
     let mut rect=RECT::default();
     GetWindowRect(window,&mut rect).is_ok() && rect.right-rect.left>=300 && rect.bottom-rect.top>=300
@@ -53,6 +54,37 @@ unsafe fn has_dingtalk_frame(pid:u32)->bool{
     let mut search=Search{pid,found:false};
     let _=EnumWindows(Some(visit),LPARAM((&mut search as *mut Search)as isize));
     search.found
+}
+/// 飞书主窗口的标题固定为应用名（切换消息、云文档等页面不变，关到托盘后仍保留）；
+/// 「在独立窗口打开」的会话、文档窗口与主窗口同进程、同类名、同样式，只有标题是会话或文档名。
+const FEISHU_TITLES:[&str;3]=["飞书","Feishu","Lark"];
+const FEISHU_FRAME:&str="Chrome_WidgetWin_1";
+fn feishu_title(title:&str)->bool{FEISHU_TITLES.iter().any(|name|name.eq_ignore_ascii_case(title.trim()))}
+fn window_title(window:HWND)->String{
+    let mut text=[0u16;256];
+    let n=unsafe{GetWindowTextW(window,&mut text)}.max(0) as usize;
+    String::from_utf16_lossy(&text[..n])
+}
+unsafe fn feishu_frame(window:HWND)->bool{
+    class_name(window)==FEISHU_FRAME && GetWindow(window,GW_OWNER).is_err()
+        && main_frame(Messenger::Feishu,FEISHU_FRAME,GetWindowLongW(window,GWL_STYLE)as u32,GetWindowLongW(window,GWL_EXSTYLE)as u32)
+}
+/// 同进程里唯一一个以应用名为标题的飞书主窗口；没有或不止一个（比如有会话恰好叫「飞书」）时不猜。
+unsafe fn feishu_main_frame(pid:u32)->Option<HWND>{
+    struct Search{pid:u32,found:Vec<HWND>}
+    unsafe extern "system" fn visit(window:HWND,data:LPARAM)->BOOL{
+        let search=&mut *(data.0 as *mut Search);
+        if window_pid(window)==search.pid && feishu_frame(window) && feishu_title(&window_title(window)){search.found.push(window);}
+        true.into()
+    }
+    let mut search=Search{pid,found:Vec::new()};
+    let _=EnumWindows(Some(visit),LPARAM((&mut search as *mut Search)as isize));
+    match search.found.as_slice(){[one]=>Some(*one),_=>None}
+}
+/// 飞书独立会话 / 文档窗口闪动时，归到同进程的主窗口：同一进程就是同一个飞书实例，不会串到其他账号。
+unsafe fn feishu_owner(window:HWND)->Option<HWND>{
+    if !feishu_frame(window) || feishu_title(&window_title(window)){return None;}
+    feishu_main_frame(window_pid(window))
 }
 fn candidates(client:Messenger,paths:&[String])->Option<Vec<Target>>{unsafe{
     struct Search<'a>{client:Messenger,paths:&'a [String],windows:Vec<Unread>}
@@ -79,7 +111,9 @@ fn select_target(client:Messenger,window:isize,accounts:&[Target])->Unread{
 pub(crate) fn flash_target(client:Messenger,window:HWND,paths:&[String])->Option<Unread>{unsafe{
     if !matches(window,paths){return None;}
     let Some(accounts)=candidates(client,paths)else{return Some(Unread::of(client));};
-    Some(select_target(client,GetAncestor(window,GA_ROOTOWNER).0 as isize,&accounts))
+    let mut root=GetAncestor(window,GA_ROOTOWNER);
+    if client==Messenger::Feishu {if let Some(main)=feishu_owner(root){root=main;}}
+    Some(select_target(client,root.0 as isize,&accounts))
 }}
 fn ready(target:Target)->bool{
     ready_with_paths(target,&client_paths(target.unread.source))
@@ -178,6 +212,22 @@ mod tests{
             assert!(dialogs.iter().all(|dialog|main_window(*dialog,Messenger::DingTalk)),"没有新版主窗口时仍按旧版 Qt 主窗口识别");
             assert_eq!(flash_target(Messenger::DingTalk,dialogs[0],&paths),Some(Unread::of(Messenger::DingTalk)),"旧版多个 Qt 主窗口仍不能猜账号");
             for dialog in dialogs{DestroyWindow(dialog).unwrap();}
+        }
+        // 本机飞书 8.6 实测：主窗口标题「飞书」，「在独立窗口打开」的会话窗口与它同进程、同类名、同样式，标题是会话名。
+        // 主窗口正常显示和关到托盘（隐藏）两种状态都要能对应到原进程，独立窗口闪动归到主窗口。
+        for (state,main_style) in [("显示",0x16cf0000u32),("关到托盘",0x06cf0000)]{
+            let frame=|title,style|CreateWindowExW(WINDOW_EX_STYLE(0x00200100),w!("Chrome_WidgetWin_1"),title,WINDOW_STYLE(style),-10000,-10000,1200,800,None,None,instance,None).unwrap();
+            let main=frame(w!("飞书"),main_style);let chat=frame(w!("少爷"),0x16cf0000);
+            let original=Target{unread:Unread{source:Messenger::Feishu,pid,window:main.0 as isize},started};
+            assert!(!main_window(chat,Messenger::Feishu),"{state}：独立会话窗口不能算第二个主窗口");
+            assert!(ready_with_paths(original,&paths),"{state}：有独立会话窗口时主窗口仍可识别");
+            assert_eq!(flash_target(Messenger::Feishu,main,&paths),Some(original.unread),"{state}：主窗口闪动对应原进程");
+            assert_eq!(flash_target(Messenger::Feishu,chat,&paths),Some(original.unread),"{state}：独立会话窗口闪动归到同进程主窗口");
+            let lookalike=frame(w!("Feishu"),0x16cf0000);
+            assert_eq!(flash_target(Messenger::Feishu,chat,&paths),Some(Unread::of(Messenger::Feishu)),"{state}：两个窗口都像主窗口时不猜");
+            DestroyWindow(lookalike).unwrap();DestroyWindow(main).unwrap();
+            assert!(main_window(chat,Messenger::Feishu),"{state}：找不到主窗口时沿用原规则");
+            DestroyWindow(chat).unwrap();
         }
     }}
     #[test]
