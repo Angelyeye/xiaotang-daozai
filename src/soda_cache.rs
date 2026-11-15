@@ -175,12 +175,16 @@ fn read_detail_at(path:&std::path::Path,title:&str,artist:&str,duration:f64)->Re
     found.ok_or(Miss::NoMatch)
 }
 
-/// 歌名里最长的一段连续字母数字（不区分大小写）：汽水在缓存记录和系统媒体信息里写的是同一个歌名，
-/// MessagePack 中字符串按原样 UTF-8 存储，可直接在记录字节里查找。太短的片段不做预筛，避免误判。
+/// 歌曲身份的前几个字符在缓存原名中必须依次出现，其间可能有标点、空格或被清理的版本后缀。
 fn title_needle(title:&str)->Option<regex::bytes::Regex>{
-    let run=title.split(|c:char|!c.is_alphanumeric()).max_by_key(|run|run.chars().count())?;
-    if run.chars().count()<2 {return None;}
-    regex::bytes::RegexBuilder::new(&regex::escape(run)).case_insensitive(true).build().ok()
+    let name=super::song_identity(title,"").0;
+    let parts:Vec<_>=name.chars().take(5).map(|c|match c {
+        // Unicode 小写化会把 İ 展开为 i 和组合点，后者在歌曲身份中被移除。
+        'i'=>"[iİ]".to_owned(),
+        _=>regex::escape(&c.to_string()),
+    }).collect();
+    if parts.len()<2 {return None;}
+    regex::bytes::RegexBuilder::new(&parts.join("(?s-u:.*?)")).case_insensitive(true).build().ok()
 }
 
 #[cfg(test)]
@@ -275,6 +279,7 @@ mod tests {
         // 撑到 40MB：超过原先整份读取的 32MB 上限。
         std::fs::OpenOptions::new().write(true).open(&path).unwrap().set_len(40*1024*1024).unwrap();
         assert_eq!(read_detail_at(&path,"歌","歌手",120.0).as_deref(),Ok("[1000,500]<0,500,0>词"));
+        assert_eq!(read_detail_at(&path,"歌 (Official Audio)","歌手",120.0).as_deref(),Ok("[1000,500]<0,500,0>词"));
         assert_eq!(read_detail_at(&path,"别的歌","歌手",120.0),Err(Miss::NoMatch));
         std::fs::write(&path,[0u8;8192]).unwrap();
         assert_eq!(read_detail_at(&path,"歌","歌手",120.0),Err(Miss::Format));
@@ -282,7 +287,10 @@ mod tests {
         assert_eq!(read_detail_at(&path,"歌","歌手",120.0),Err(Miss::Missing));
     }
     #[test]
-    fn title_needle_prefilters_by_the_longest_alphanumeric_run(){
+    fn title_needle_accepts_equivalent_spellings(){
+        assert!(title_needle("Go (Official Audio)").unwrap().is_match(b"Go"));
+        assert!(title_needle("Sunrise (feat. Guest)").unwrap().is_match(b"Sun-rise"));
+        assert!(title_needle("Iz").unwrap().is_match("İ-z".as_bytes()));
         let needle=title_needle("江南-林俊杰(JJ Lin)（Cover 林俊杰）").unwrap();
         assert!(needle.is_match("…江南-林俊杰(JJ Lin)（Cover 林俊杰）…".as_bytes()));
         let needle=title_needle("Fever Pitch").unwrap();

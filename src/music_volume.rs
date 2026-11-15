@@ -18,10 +18,11 @@ fn submit(job:Job)->bool {
 }
 
 /// 在音量线程上执行并最多等 2 秒；超时按失败处理。
-fn run(job:impl FnOnce()->bool+Send+'static)->bool {
+fn run(job:impl FnOnce(Instant)->bool+Send+'static)->bool {
     let (tx,rx)=mpsc::sync_channel(1);
-    if !submit(Box::new(move||{let _=tx.send(job());})){return false;}
-    rx.recv_timeout(Duration::from_secs(2)).unwrap_or(false)
+    let deadline=Instant::now()+Duration::from_secs(2);
+    if !submit(Box::new(move||{let _=tx.send(Instant::now()<deadline && job(deadline));})){return false;}
+    rx.recv_timeout(deadline.saturating_duration_since(Instant::now())).unwrap_or(false)
 }
 
 type Latest=Arc<Mutex<Option<(String,Option<(u32,bool)>)>>>;
@@ -121,23 +122,26 @@ pub fn read(source:&str)->Option<(u32,bool)> {
 #[cfg(windows)]
 pub fn set_volume(source:&str,percent:u32)->bool {
     let source=source.to_string();
-    run(move||apply(&source,|session|unsafe {
+    run(move|deadline|apply(&source,deadline,|session|unsafe {
         session.SetMasterVolume(percent.min(100) as f32/100.0,std::ptr::null()).is_ok()
-            && session.SetMute(false,std::ptr::null()).is_ok()
+            && Instant::now()<deadline && session.SetMute(false,std::ptr::null()).is_ok()
     }))
 }
 
 #[cfg(windows)]
 pub fn set_mute(source:&str,muted:bool)->bool {
     let source=source.to_string();
-    run(move||apply(&source,|session|unsafe{session.SetMute(muted,std::ptr::null()).is_ok()}))
+    run(move|deadline|apply(&source,deadline,|session|unsafe{session.SetMute(muted,std::ptr::null()).is_ok()}))
 }
 
 #[cfg(windows)]
-fn apply(source:&str,change:impl Fn(&windows::Win32::Media::Audio::ISimpleAudioVolume)->bool)->bool {
+fn apply(source:&str,deadline:Instant,change:impl Fn(&windows::Win32::Media::Audio::ISimpleAudioVolume)->bool)->bool {
     let sessions=platform::sessions(source);
     let mut success=!sessions.is_empty();
-    for session in &sessions{success=change(session) && success;}
+    for session in &sessions{
+        if Instant::now()>=deadline{return false;}
+        success=change(session) && success;
+    }
     success
 }
 
@@ -165,6 +169,16 @@ mod tests {
         for i in 0..20 {assert_eq!(reader.poll(&format!("daozai-stuck-{i}.exe")),None);}
         assert!(start.elapsed()<Duration::from_millis(200),"音量线程卡住时，采样线程不能跟着等待");
         drop(release);
+    }
+
+    #[test]
+    fn expired_write_is_discarded_when_the_worker_resumes(){
+        let (release,wait)=mpsc::channel::<()>();
+        assert!(submit(Box::new(move||{let _=wait.recv_timeout(Duration::from_secs(10));})));
+        let (ran,observed)=mpsc::channel();
+        assert!(!run(move|_|{let _=ran.send(());true}));
+        drop(release);
+        assert_eq!(observed.recv_timeout(Duration::from_secs(3)),Err(mpsc::RecvTimeoutError::Disconnected));
     }
 
     #[test]

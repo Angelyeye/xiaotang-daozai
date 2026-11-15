@@ -2061,6 +2061,12 @@ impl App {
                             ui.label(egui::RichText::new("桌面顶部的音乐、专注、提醒与日程小助手。").size(12.0).color(settings_color(ctx,Color32::from_gray(180),Color32::from_gray(75))));
                             ui.horizontal_wrapped(|ui|{
                                 if ui.button("打开本地数据目录").clicked(){self.pending.push(Cmd::Open(crate::model::config_dir()));}
+                                if ui.button("收集诊断").clicked(){
+                                    match crate::updates::diagnostics_launcher(&crate::model::config_dir().join("诊断工具")){
+                                        Ok(path)=>self.pending.push(Cmd::Open(path)),
+                                        Err(_)=>self.say("无法写入诊断工具，请检查本地数据目录是否可写"),
+                                    }
+                                }
                                 ui.label(egui::RichText::new("设备图标：Solar Icons · 480 Design").size(11.0).color(settings_color(ctx,Color32::from_gray(150),Color32::from_gray(105))));
                                 ui.hyperlink_to("CC BY 4.0", "https://creativecommons.org/licenses/by/4.0/");
                             });

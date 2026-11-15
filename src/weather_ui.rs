@@ -658,9 +658,13 @@ impl App {
         self.weather_source.poll(enabled);
         if self.weather_source.displayed==crate::weather_source_ui::Provider::Qweather {
             let now=chrono::Utc::now().timestamp();
-            self.weather_source.runtime.poll(enabled,now);
+            if self.weather_source.runtime.poll(enabled,now) {
+                self.weather.snapshot=self.weather_source.runtime.snapshot();
+            }
             if enabled&&!cfg!(test){if let Some(client)=&self.weather_source.client {self.weather_source.runtime.refresh(client,now,false);}}
-            self.weather.snapshot=self.weather_source.runtime.snapshot();
+            if let Some(snapshot)=&mut self.weather.snapshot {
+                if let Some(sun)=&snapshot.sun_times {snapshot.day=now>=sun.sunrise&&now<sun.sunset;}
+            }
             self.weather.loading=self.weather_source.runtime.loading();
             self.weather.error=self.weather_source.runtime.error.map(|e|e.text().to_string()).or_else(||if self.weather_source.client.is_none(){Some("尚未配置和风凭据，请到天气设置填写并测试。".into())}else if self.weather_source.config.location.is_none(){Some("请先选择和风城市，和风暂不支持自动定位。".into())}else{None});
             return;

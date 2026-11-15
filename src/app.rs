@@ -998,7 +998,7 @@ impl App {
             quota: crate::quota_ui::State::load(),
             weather,
             weather_source,
-            updates: Default::default(),
+            updates: crate::updates::State::load(model::config_dir().join("update-check.json")),
             resident: Default::default(), resident_power:(None,false),
         }
     }

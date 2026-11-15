@@ -29,6 +29,7 @@ pub(crate) struct State {
     next_check: Option<Instant>,
     automatic_check: bool,
     notified_version: Option<String>,
+    history_path: Option<PathBuf>,
 }
 
 impl Drop for State {
@@ -36,6 +37,29 @@ impl Drop for State {
 }
 
 impl State {
+    pub(crate) fn load(path: PathBuf) -> Self {
+        let mut state = State::default();
+        if let Some((next, version)) = std::fs::read(&path).ok()
+            .and_then(|bytes| serde_json::from_slice::<(i64, Option<String>)>(&bytes).ok()) {
+            let seconds = next.saturating_sub(chrono::Utc::now().timestamp()).clamp(0, CHECK_INTERVAL.as_secs() as i64);
+            state.next_check = Some(Instant::now() + STARTUP_DELAY.max(Duration::from_secs(seconds as u64)));
+            state.notified_version = version;
+        }
+        state.history_path = Some(path);
+        state
+    }
+
+    fn remember_check(&self, delay: Duration) {
+        let Some(path) = &self.history_path else { return };
+        let next = chrono::Utc::now().timestamp() + delay.as_secs() as i64;
+        if let Some(parent) = path.parent() {
+            if std::fs::create_dir_all(parent).is_err() { return; }
+        }
+        if let Ok(bytes) = serde_json::to_vec(&(next, &self.notified_version)) {
+            let _ = crate::model::atomic_write(path, &bytes);
+        }
+    }
+
     fn should_check(&mut self, now: Instant) -> bool {
         now >= *self.next_check.get_or_insert(now + STARTUP_DELAY) && self.rx.is_none() && !self.dialog_open
     }
@@ -64,10 +88,12 @@ impl State {
             match event {
                 Event::Checked(result) => {
                     let automatic = std::mem::take(&mut self.automatic_check);
-                    self.next_check = Some(Instant::now() + if result.is_err() { RETRY_INTERVAL } else { CHECK_INTERVAL });
+                    let delay = if result.is_err() { RETRY_INTERVAL } else { CHECK_INTERVAL };
+                    self.next_check = Some(Instant::now() + delay);
                     self.dialog_open = matches!(&result, Ok(Some(release)) if !automatic || self.notified_version.as_deref() != Some(release.version.as_str()));
                     self.focus_requested = self.dialog_open;
                     if self.dialog_open { if let Ok(Some(release)) = &result { self.notified_version = Some(release.version.clone()); } }
+                    self.remember_check(delay);
                     self.result = Some(result); self.rx = None;
                 }
                 Event::Progress(value) => self.progress = value,
@@ -247,10 +273,19 @@ impl State {
 
 }
 
-// Windows 的 GL 透明窗口可能仍显示黑底，按绘制轮廓裁掉窗口外沿。
+/// 旧版应用内升级只替换 exe；从新程序内取出配套工具，安装目录只读时也可收集。
+pub(crate) fn diagnostics_launcher(dir:&std::path::Path)->std::io::Result<PathBuf>{
+    let scripts=dir.join("scripts");
+    std::fs::create_dir_all(&scripts)?;
+    crate::model::atomic_write(&scripts.join("collect-diagnostics.ps1"),include_bytes!("../scripts/collect-diagnostics.ps1"))?;
+    let launcher=dir.join("收集岛仔诊断.cmd");
+    crate::model::atomic_write(&launcher,include_bytes!("../收集岛仔诊断.cmd"))?;
+    Ok(launcher)
+}
+
 /// 只统计岛仔自己的文件（KB）。共享安装文件夹里的其他软件不算在内。
 fn own_files_kb(dir: &std::path::Path) -> u32 {
-    let bytes: u64 = ["daozai.exe", "Uninstall.exe", "LICENSE", "THIRD_PARTY_NOTICES.txt"].iter()
+    let bytes: u64 = ["daozai.exe", "Uninstall.exe", "LICENSE", "THIRD_PARTY_NOTICES.txt","收集岛仔诊断.cmd","scripts/collect-diagnostics.ps1"].iter()
         .filter_map(|name| std::fs::metadata(dir.join(name)).ok()).filter(|meta| meta.is_file()).map(|meta| meta.len()).sum();
     bytes.div_ceil(1024).min(u64::from(u32::MAX)) as u32
 }
@@ -435,6 +470,18 @@ fn parse_release(value: &serde_json::Value, current: &str) -> Result<Option<Stri
 #[cfg(test)]
 mod install_size_tests {
     #[test]
+    fn exe_only_upgrade_can_restore_both_diagnostic_tools(){
+        let dir=std::env::temp_dir().join(format!("daozai-diagnostic-tools-{}",std::process::id()));
+        let launcher=super::diagnostics_launcher(&dir).unwrap();
+        let script=dir.join("scripts/collect-diagnostics.ps1");
+        assert_eq!(std::fs::read(&launcher).unwrap(),include_bytes!("../收集岛仔诊断.cmd").as_slice());
+        std::fs::write(&script,b"old").unwrap();
+        super::diagnostics_launcher(&dir).unwrap();
+        assert_eq!(std::fs::read(&script).unwrap(),include_bytes!("../scripts/collect-diagnostics.ps1").as_slice());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn install_size_counts_only_daozai_files() {
         let dir = std::env::temp_dir().join(format!("daozai-size-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("Other App")).unwrap();
@@ -486,9 +533,12 @@ mod tests {
 
     #[test]
     fn automatic_notice_is_once_per_version_and_manual_check_can_reopen_it() {
-        let mut state = State::default();
+        let path=std::env::temp_dir().join(format!("daozai-update-check-{}.json",std::process::id()));
+        let _=std::fs::remove_file(&path);
         for (automatic, version, expected) in [(true, "v0.6.65", true), (true, "v0.6.65", false),
             (true, "v0.6.66", true), (false, "v0.6.66", true)] {
+            let mut state=State::load(path.clone());
+            if path.exists() { assert!(!state.should_check(Instant::now()+Duration::from_secs(3600))); }
             state.automatic_check = automatic;
             let (tx, rx) = mpsc::channel(); state.rx = Some(rx);
             tx.send(Event::Checked(Ok(Some(Release { version: version.into(), notes: String::new(), page: RELEASES.into(),
@@ -499,6 +549,7 @@ mod tests {
             assert!(matches!(&state.result, Some(Ok(Some(release))) if release.version == version));
             state.dismiss();
         }
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

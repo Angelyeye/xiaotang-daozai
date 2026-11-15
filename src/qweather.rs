@@ -148,11 +148,22 @@ struct Cache {host:String,location:Option<Location>,current:Option<Value>,daily:
 pub(crate) struct Runtime {
     cache:Cache,current:Option<Receiver<Result<Value,Error>>>,daily:Option<Receiver<Result<Value,Error>>>,
     last_current:i64,last_daily:i64,pub error:Option<Error>,errors:[Option<Error>;2],paused:bool,current_failures:u32,
+    snapshot_second:Option<i64>,snapshot_date:Option<chrono::NaiveDate>,limit_check_minute:Option<i64>,
 }
 impl Runtime {
     pub fn reset(&mut self,host:&str,location:Option<Location>){
         let cache=std::fs::read(crate::model::config_dir().join("qweather-cache.json")).ok().and_then(|b|serde_json::from_slice::<Cache>(&b).ok()).filter(|c|c.host==host&&c.location==location).unwrap_or(Cache{host:host.into(),location,..Default::default()});
         *self=Self{cache,..Default::default()};
+        self.day_changed(chrono::Utc::now().timestamp());
+    }
+    fn day_changed(&mut self,now:i64)->bool {
+        if self.snapshot_second==Some(now){return false;}
+        self.snapshot_second=Some(now);
+        let date=self.cache.location.as_ref().and_then(|l|l.timezone.parse::<chrono_tz::Tz>().ok())
+            .and_then(|zone|zone.timestamp_opt(now,0).single()).map(|t|t.date_naive());
+        let changed=self.snapshot_date!=date;
+        self.snapshot_date=date;
+        changed
     }
     pub fn loading(&self)->bool {self.current.is_some()||self.daily.is_some()}
     /// 连续实况失败，或凭据、额度等错误已暂停刷新。
@@ -162,16 +173,21 @@ impl Runtime {
         if !client.gate.load(Ordering::SeqCst){self.current=None;self.daily=None;return;}
         if manual&&!self.can_refresh(now){return;}
         if manual {self.paused=false;self.error=None;self.errors=[None,None];}
-        if self.paused {if self.error==Some(Error::Limit)&&usage()<LIMIT{self.paused=false;}else{return;}}
-        let Some(location)=self.cache.location.clone() else{return;};
+        if self.paused {
+            if self.error!=Some(Error::Limit)||self.limit_check_minute==Some(now/60){return;}
+            self.limit_check_minute=Some(now/60);
+            if usage()>=LIMIT{return;}
+            self.paused=false;
+        }
+        let Some(location)=self.cache.location.as_ref() else{return;};
         let current_due=manual||now-self.cache.current_at>=CURRENT_INTERVAL;
-        let daily_due=manual||now-self.cache.daily_at>=DAILY_INTERVAL||self.snapshot().is_some_and(|s|s.days.len()<7);
+        let daily_due=manual||self.cache.daily.is_none()||now-self.cache.daily_at>=DAILY_INTERVAL;
         let minimum=if manual{30}else{120};
         if current_due&&self.current.is_none()&&now-self.last_current>=minimum {self.last_current=now;let c=client.clone();let l=location.clone();self.current=Some(spawn(move||c.weather(&l,false)));}
-        if daily_due&&self.daily.is_none()&&now-self.last_daily>=minimum {self.last_daily=now;let c=client.clone();self.daily=Some(spawn(move||c.weather(&location,true)));}
+        if daily_due&&self.daily.is_none()&&now-self.last_daily>=minimum {self.last_daily=now;let c=client.clone();let l=location.clone();self.daily=Some(spawn(move||c.weather(&l,true)));}
     }
-    pub fn poll(&mut self,enabled:bool,now:i64){
-        if !enabled {self.current=None;self.daily=None;return;}
+    pub fn poll(&mut self,enabled:bool,now:i64)->bool {
+        if !enabled {self.current=None;self.daily=None;return false;}
         let mut changed=false;
         for daily in [false,true]{
             let slot=if daily{&mut self.daily}else{&mut self.current};
@@ -184,6 +200,7 @@ impl Runtime {
         }
         self.error=self.errors.iter().flatten().copied().next();
         if changed {let _=crate::model::atomic_write(&crate::model::config_dir().join("qweather-cache.json"),&serde_json::to_vec(&self.cache).unwrap_or_default());}
+        self.day_changed(now)||changed
     }
     pub fn snapshot(&self)->Option<Snapshot> {
         let l=self.cache.location.as_ref()?;let mut s=parse_current(self.cache.current.as_ref()?,l,self.cache.current_at).ok()?;
@@ -235,6 +252,27 @@ mod tests {
         let(days,sun)=parse_daily(&daily(),&location()).unwrap();assert_eq!(days[0].rain,80);let sun=sun.unwrap();assert_eq!(sun.clock(sun.sunrise),"06:10");assert_eq!(sun.timezone,"Asia/Shanghai");
         let mut no_sun=daily();no_sun["days"][0]["astro"]=json!({});assert!(parse_daily(&no_sun,&location()).unwrap().1.is_none());
         let mut invalid=current();invalid["temperature"]["unit"]=json!("unknown");assert!(parse_current(&invalid,&location(),1).is_err());s.at=123;assert_eq!(s.at,123);
+    }
+    #[test]
+    fn fresh_short_forecast_obeys_the_success_interval(){
+        let now=chrono::Utc::now().timestamp();
+        let client=Client::new("example.re.qweatherapi.com","test",Arc::new(AtomicBool::new(true))).unwrap();
+        let mut runtime=Runtime::default();
+        runtime.cache=Cache{location:Some(location()),current:Some(current()),daily:Some(daily()),current_at:now,daily_at:now,..Default::default()};
+        assert_eq!(runtime.snapshot().unwrap().days.len(),1);
+        runtime.refresh(&client,now+120,false);
+        assert!(!runtime.loading());
+    }
+    #[test]
+    fn display_only_rebuilds_on_new_data_or_city_midnight(){
+        let mut runtime=Runtime::default();
+        runtime.cache.location=Some(location());
+        let midnight=chrono::DateTime::parse_from_rfc3339("2026-11-14T00:00:00+08:00").unwrap().timestamp();
+        assert!(runtime.poll(true,midnight-2));
+        assert!(!runtime.poll(true,midnight-1));
+        assert!(!runtime.poll(false,midnight));
+        assert!(runtime.poll(true,midnight));
+        assert!(!runtime.poll(true,midnight));
     }
     #[test]
     fn official_minute_precision_dates_keep_their_offset(){
