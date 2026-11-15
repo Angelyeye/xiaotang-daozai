@@ -36,6 +36,64 @@ pub fn has_real_alpha(size: [usize; 2], rgba: &[u8]) -> bool {
     [corner(0, 0), corner(w - 1, 0), corner(0, h - 1), corner(w - 1, h - 1)].iter().any(|&a| a < 255)
 }
 
+/// 读回画面没有 alpha 时（部分 AMD 显卡的 OpenGL 默认帧缓冲不带透明通道），按岛体轮廓
+/// 算出每个像素被覆盖的比例当作 alpha：轮廓是物理像素坐标的闭合多边形，多块之间取并集。
+/// 每行取 4 条子扫描线、横向按精确的线段长度累计，边缘过渡与 egui 自身的抗锯齿相当。
+pub fn coverage_mask(size: [usize; 2], polygons: &[Vec<(f32, f32)>]) -> Vec<u8> {
+    const SUB: usize = 4;
+    let [w, h] = size;
+    let mut mask = vec![0u8; w * h];
+    let edges: Vec<Vec<((f32, f32), (f32, f32))>> = polygons.iter().filter(|p| p.len() >= 3)
+        .map(|p| p.iter().zip(p.iter().cycle().skip(1)).map(|(a, b)| (*a, *b)).collect()).collect();
+    let (top, bottom) = edges.iter().flatten().fold((f32::MAX, f32::MIN), |(t, b), (p, q)| (t.min(p.1).min(q.1), b.max(p.1).max(q.1)));
+    if w == 0 || h == 0 || edges.is_empty() || !(top < bottom) { return mask; }
+    let (y0, y1) = (top.floor().max(0.0) as usize, (bottom.ceil().max(0.0) as usize).min(h));
+    let (mut row, mut part) = (vec![0f32; w + 1], vec![0f32; w + 1]);
+    let mut xs: Vec<(f32, i32)> = Vec::new();
+    let weight = 1.0 / SUB as f32;
+    for y in y0..y1 {
+        row.fill(0.0);
+        for poly in &edges {
+            part.fill(0.0);
+            for s in 0..SUB {
+                let sy = y as f32 + (s as f32 + 0.5) * weight;
+                xs.clear();
+                for &((ax, ay), (bx, by)) in poly {
+                    if (ay <= sy) != (by <= sy) {
+                        xs.push((ax + (sy - ay) / (by - ay) * (bx - ax), if by > ay { 1 } else { -1 }));
+                    }
+                }
+                xs.sort_by(|a, b| a.0.total_cmp(&b.0));
+                // 非零环绕：环绕数从 0 变非 0 处开始、回到 0 处结束，与 GDI 的 WINDING 区域一致。
+                let (mut wind, mut start) = (0, 0.0f32);
+                for &(x, dir) in &xs {
+                    if wind == 0 { start = x; }
+                    wind += dir;
+                    if wind == 0 {
+                        let (a, b) = (start.clamp(0.0, w as f32), x.clamp(0.0, w as f32));
+                        if b <= a { continue; }
+                        let (ia, ib) = (a as usize, b as usize);
+                        if ia == ib { part[ia] += (b - a) * weight; continue; }
+                        part[ia] += ((ia + 1) as f32 - a) * weight;
+                        for v in &mut part[ia + 1..ib] { *v += weight; }
+                        part[ib] += (b - ib as f32) * weight;
+                    }
+                }
+            }
+            for (r, p) in row.iter_mut().zip(&part) { *r = r.max(*p); }
+        }
+        for (m, r) in mask[y * w..(y + 1) * w].iter_mut().zip(&row) { *m = (r.min(1.0) * 255.0).round() as u8; }
+    }
+    mask
+}
+
+/// 把轮廓算出的 alpha 套到读回的画面上：画布清屏色是透明黑，读回的 RGB 本来就是「颜色 × 覆盖率」，
+/// 再按预乘要求把每个通道压到不超过 alpha，轮廓外的像素全部清空。
+pub fn apply_mask(rgba: &[u8], mask: &[u8], out: &mut Vec<u8>) {
+    out.clear();
+    out.extend(rgba.chunks_exact(4).zip(mask).flat_map(|(p, &a)| [p[0].min(a), p[1].min(a), p[2].min(a), a]));
+}
+
 /// 显示窗口：鼠标一律穿透、不激活。
 unsafe extern "system" fn display_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
@@ -230,6 +288,46 @@ mod tests {
         clear[3] = 0;
         assert!(has_real_alpha([4, 4], &clear));
         assert!(!has_real_alpha([4, 4], &clear[..32]), "尺寸不符视为无效");
+    }
+
+    #[test]
+    fn coverage_mask_gives_fractional_edges() {
+        // x 1.5..3.5、y 0..2 的矩形：左右边缘各盖住半个像素，中间整格。
+        let rect = vec![(1.5, 0.0), (3.5, 0.0), (3.5, 2.0), (1.5, 2.0)];
+        let mask = coverage_mask([5, 2], &[rect]);
+        assert_eq!(&mask[..5], &[0, 128, 255, 128, 0]);
+        assert_eq!(&mask[..5], &mask[5..]);
+        // 上下边缘落在像素中间时同样只盖一半。
+        let half = coverage_mask([1, 2], &[vec![(0.0, 0.5), (1.0, 0.5), (1.0, 2.0), (0.0, 2.0)]]);
+        assert_eq!(half, vec![128, 255]);
+    }
+
+    #[test]
+    fn coverage_mask_smooths_curves_and_unions_shapes() {
+        // 圆：内部全满、外部全空，边缘一圈是过渡值（这正是轮廓裁剪做不到的）。
+        let circle: Vec<(f32, f32)> = (0..64).map(|i| { let a = i as f32 / 64.0 * std::f32::consts::TAU; (10.0 + 7.0 * a.cos(), 10.0 + 7.0 * a.sin()) }).collect();
+        let mask = coverage_mask([20, 20], &[circle]);
+        assert_eq!(mask[10 * 20 + 10], 255);
+        assert_eq!(mask[0], 0);
+        let soft = mask.iter().filter(|&&a| a > 0 && a < 255).count();
+        assert!(soft >= 30, "圆周应有一圈抗锯齿过渡像素，实际 {soft}");
+        // 两块方向相反、互相重叠的轮廓取并集，重叠处不能被抵消成空洞。
+        let a = vec![(0.0, 0.0), (6.0, 0.0), (6.0, 4.0), (0.0, 4.0)];
+        let b = vec![(4.0, 0.0), (4.0, 4.0), (10.0, 4.0), (10.0, 0.0)];
+        let both = coverage_mask([10, 4], &[a, b]);
+        assert!(both.iter().all(|&v| v == 255), "并集应整块覆盖：{both:?}");
+        // 轮廓超出画布时安全截断。
+        let out = coverage_mask([4, 4], &[vec![(-5.0, -5.0), (9.0, -5.0), (9.0, 9.0), (-5.0, 9.0)]]);
+        assert!(out.iter().all(|&v| v == 255));
+        assert!(coverage_mask([4, 4], &[]).iter().all(|&v| v == 0));
+    }
+
+    #[test]
+    fn mask_keeps_premultiplied_colors_valid() {
+        let rgba = [200u8, 100, 50, 255, 255, 255, 255, 255, 30, 30, 30, 255];
+        let mut out = Vec::new();
+        apply_mask(&rgba, &[255, 128, 0], &mut out);
+        assert_eq!(out, vec![200, 100, 50, 255, 128, 128, 128, 128, 0, 0, 0, 0]);
     }
 
     #[test]
