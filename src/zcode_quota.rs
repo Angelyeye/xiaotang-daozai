@@ -243,7 +243,10 @@ mod tests{
         assert_eq!(&config.accounts[..2],before.accounts.as_slice());assert_eq!(config.selected,before.selected);assert_eq!(config.accounts.len(),3);
         assert_eq!(std::fs::read_to_string(&path).unwrap(),raw);assert_eq!(cleanup.1.get_password().unwrap(),encoded);
         assert_eq!(system_key(Path::new(&path.to_string_lossy().replace('\\',"/"))).unwrap(),key);
-        assert_eq!(system_key(&std::fs::canonicalize(&path).unwrap()).unwrap(),key);
+        // 只添加 Windows 扩展路径前缀，保留 ZCode 计算凭据标识时使用的短目录名。
+        let spelling=path.to_str().unwrap();
+        let extended=if let Some(unc)=spelling.strip_prefix(r"\\"){format!(r"\\?\UNC\{unc}")}else{format!(r"\\?\{spelling}")};
+        assert_eq!(system_key(Path::new(&extended)).unwrap(),key);
         let agent=ureq::AgentBuilder::new().try_proxy_from_env(false).middleware(|request:ureq::Request,_:ureq::MiddlewareNext|{
             assert_eq!(request.url(),"https://bigmodel.cn/api/monitor/usage/quota/limit");assert_eq!(request.header("Authorization"),Some("synthetic-coding-key"));
             ureq::Response::new(200,"Test",r#"{"code":200,"data":{"limits":[{"type":"TOKENS_LIMIT","percentage":40}]}}"#)

@@ -755,6 +755,8 @@ mod tests {
             loop {
                 if !matches!(cancel.try_recv(),Err(TryRecvError::Empty)){return false;}
                 if let Ok((mut stream,_))=listener.accept() {
+                    // Windows 接受的连接继承监听器的非阻塞状态，先等客户端发出请求。
+                    stream.set_nonblocking(false).unwrap();
                     stream.set_read_timeout(Some(Duration::from_secs(12))).unwrap();
                     if !matches!(stream.read(&mut [0;4096]),Ok(n) if n>0){return false;}
                     return stream.write_all(response.as_bytes()).is_ok();
@@ -904,6 +906,7 @@ mod tests {
             let start=std::time::Instant::now();
             while start.elapsed()<Duration::from_secs(3) {
                 if let Ok((mut stream,_))=listener.accept() {
+                    stream.set_nonblocking(false).unwrap();
                     stream.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
                     let mut request=[0;4096];let n=stream.read(&mut request).unwrap();
                     let request=String::from_utf8_lossy(&request[..n]).into_owned();
