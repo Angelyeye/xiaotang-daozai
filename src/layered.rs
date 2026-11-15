@@ -27,6 +27,18 @@ pub fn image_hash(size: [usize; 2], rgba: &[u8]) -> u64 {
     h
 }
 
+/// 画面自己在动（歌词滚动、动效）而没有用户输入时，两次读回的最小间隔：约 30 帧/秒。
+/// 每次读回都要 GPU 回传整帧、换通道再交给系统合成，2 倍缩放下每帧约 2ms，60 帧/秒会持续占掉十几个百分点的单核。
+pub const AMBIENT_READBACK: std::time::Duration = std::time::Duration::from_millis(33);
+
+/// 这一帧要不要请求下一次读回：`None` 立即请求；`Some(d)` 先等 d 再重绘、到时再请求（保证最后一帧不会漏掉）。
+/// 拖动、悬停、点击等有输入的帧保持满帧，跟手不打折扣。
+pub fn readback_delay(last: Option<std::time::Instant>, now: std::time::Instant, interactive: bool) -> Option<std::time::Duration> {
+    if interactive { return None; }
+    let elapsed = now.saturating_duration_since(last?);
+    (elapsed < AMBIENT_READBACK).then(|| AMBIENT_READBACK - elapsed)
+}
+
 /// 读回的画面里必须真的有透明像素（画布四角一定是透明的），否则说明这条路径读不到 alpha，
 /// 不能切到分层窗口（整块画布会变成黑底）。
 pub fn has_real_alpha(size: [usize; 2], rgba: &[u8]) -> bool {
@@ -279,6 +291,23 @@ impl Drop for Layered {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ambient_animation_readback_is_paced_but_input_stays_full_rate() {
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        assert_eq!(readback_delay(None, now, false), None, "第一次读回不等待");
+        assert_eq!(readback_delay(Some(now), now + Duration::from_millis(10), false), Some(Duration::from_millis(23)), "动画期间未到间隔时延后");
+        assert_eq!(readback_delay(Some(now), now + AMBIENT_READBACK, false), None, "到间隔立即读回");
+        assert_eq!(readback_delay(Some(now), now + Duration::from_millis(1), true), None, "有输入时保持满帧");
+        // 60 帧/秒的动画持续 1 秒：读回次数减半左右。
+        let (mut last, mut count) = (None, 0);
+        for frame in 0..60u64 {
+            let t = now + Duration::from_micros(frame * 16_667);
+            if readback_delay(last, t, false).is_none() { last = Some(t); count += 1; }
+        }
+        assert!((28..=31).contains(&count), "约 30 次/秒，实际 {count}");
+    }
 
     #[test]
     fn opaque_readback_is_not_trusted_for_layering() {

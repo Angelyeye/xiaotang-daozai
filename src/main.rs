@@ -17,6 +17,9 @@ struct Shell {
     t0: Instant,
     #[cfg(windows)]
     frame_at: Instant,
+    /// 兼容渲染上一次请求读回画面的时刻（无输入的持续动画按约 30 帧/秒读回）。
+    #[cfg(windows)]
+    readback_at: Option<Instant>,
     media: smtc::Shared,
     seek_rx: Option<(&'static str,std::sync::mpsc::Receiver<bool>)>,
     media_control:Option<smtc::ControlWorker>,
@@ -164,6 +167,8 @@ impl Shell {
             t0: Instant::now(),
             #[cfg(windows)]
             frame_at: Instant::now(),
+            #[cfg(windows)]
+            readback_at: None,
             media,
             seek_rx: None,
             media_control:None,
@@ -612,7 +617,13 @@ impl eframe::App for Shell {
                 ));
                 let changed=shot.as_ref().is_some_and(|image|native.present_frame(image.size,image.as_raw()));
                 if shot.is_none() || changed || other_input {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
+                    // 拖动、悬停等有输入时满帧跟手；歌词滚动这类自己在动的画面约 30 帧/秒读回，
+                    // 未到间隔就预约一次重绘，到时补上读回，动画停下时的最后一帧不会漏掉。
+                    let now=Instant::now();
+                    match daozai::layered::readback_delay(self.readback_at,now,other_input) {
+                        None=>{self.readback_at=Some(now);ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));}
+                        Some(wait)=>ctx.request_repaint_after(wait),
+                    }
                 }
             }
             let r = |r: egui::Rect| (r.left(), r.top(), r.width(), r.height());
