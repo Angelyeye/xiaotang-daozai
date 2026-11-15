@@ -50,7 +50,8 @@ fn executable(source:&str)->Option<String> {
     let source=source.to_lowercase();
     match source.as_str() {
         "kugou"=>Some("kugou.exe".into()),
-        "qqmusic"=>Some("qqmusic.exe".into()),
+        // QQ 音乐 22.82 起系统媒体会话的身份名改为 Tencent.QQMusic。
+        "qqmusic"|"tencent.qqmusic"=>Some("qqmusic.exe".into()),
         "spotify"=>Some("spotify.exe".into()),
         "汽水音乐"=>Some("sodamusic.exe".into()),
         _ if source.ends_with(".exe") && !source.contains(['\\','/'])=>Some(source),
@@ -157,7 +158,7 @@ mod tests {
     use super::*;
     #[test]
     fn player_names_require_an_exact_executable_or_packaged_identity(){
-        for (source,exe) in [("QQMusic.exe","qqmusic.exe"),("kugou","kugou.exe"),("汽水音乐","sodamusic.exe")]{assert_eq!(executable(source).as_deref(),Some(exe));}
+        for (source,exe) in [("QQMusic.exe","qqmusic.exe"),("Tencent.QQMusic","qqmusic.exe"),("kugou","kugou.exe"),("汽水音乐","sodamusic.exe")]{assert_eq!(executable(source).as_deref(),Some(exe));}
         for source in ["","music","QQMusic.exe.bak",r"C:\QQMusic.exe","SpotifyAB.SpotifyMusic_123!Spotify"]{assert_eq!(executable(source),None);}
     }
     #[test]

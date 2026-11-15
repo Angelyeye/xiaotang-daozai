@@ -4318,6 +4318,29 @@ fn music_seek_drag_previews_and_commits_on_release(){
 }
 
 #[test]
+fn old_and_new_qqmusic_seek_and_hold_the_target_after_release(){
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    for source in ["QQMusic.exe","Tencent.QQMusic"] {
+        let mut h=H::new();h.app.show_lyrics=false;
+        h.media=crate::smtc::NowPlaying{source:source.into(),title:"Track".into(),artist:"Artist".into(),position:12.0,duration:120.0,playback_type:crate::smtc::MediaKind::Music,..Default::default()};
+        h.hover(Pos2::new(WIN_W/2.0,12.0),1.0);
+        let (x,w,y)=(96.0,221.0,92.6);
+        let press=H::local(x+w*0.1,y);h.cursor=Some(press);
+        h.frame(vec![egui::Event::PointerMoved(press)]);
+        h.frame(vec![egui::Event::PointerButton{pos:press,button:egui::PointerButton::Primary,pressed:true,modifiers:Default::default()}]);
+        let to=H::local(x+w*0.75,y);h.cursor=Some(to);
+        h.frame(vec![egui::Event::PointerMoved(to)]);
+        assert!(h.shapes.iter().any(|s|matches!(&s.shape,egui::Shape::Text(t) if t.galley.text()=="01:30")),"{source} 拖动中显示目标时间");
+        h.frame(vec![egui::Event::PointerButton{pos:to,button:egui::PointerButton::Primary,pressed:false,modifiers:Default::default()}]);
+        assert!(h.cmds.iter().any(|c|matches!(c,crate::app::Cmd::Media(crate::smtc::Transport::Seek(t)) if (*t-90.0).abs()<0.1)),"{source} 松手提交跳转");
+        // 播放器还没回报新位置：松手后仍显示目标时间，不弹回 00:12。
+        h.frame(vec![]);
+        assert!(h.shapes.iter().any(|s|matches!(&s.shape,egui::Shape::Text(t) if t.galley.text()=="01:30")),"{source} 松手后保持目标时间");
+        assert!(crate::smtc::is_qqmusic(source));
+    }
+}
+
+#[test]
 fn volume_hud_drag_maps_pointer_to_percentage(){
     let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());let mut h=H::new();h.frame(vec![]);
     h.app.alert("系统音量","音量 0%",5,false);

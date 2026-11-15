@@ -7,7 +7,7 @@ pub(crate) fn player_exe(source:&str)->Option<&'static str> {
     Some(match source.to_ascii_lowercase().as_str() {
         "kugou"|"kugou.exe"=>"KuGou.exe",
         "cloudmusic.exe"=>"cloudmusic.exe",
-        "qqmusic"|"qqmusic.exe"=>"QQMusic.exe",
+        "qqmusic"|"qqmusic.exe"|"tencent.qqmusic"=>"QQMusic.exe",
         "汽水音乐"|"sodamusic.exe"=>"SodaMusic.exe",
         "spotify"|"spotify.exe"=>"Spotify.exe",
         "kwmusic.exe"=>"kwmusic.exe",
