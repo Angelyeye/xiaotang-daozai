@@ -273,19 +273,10 @@ impl State {
 
 }
 
-/// 旧版应用内升级只替换 exe；从新程序内取出配套工具，安装目录只读时也可收集。
-pub(crate) fn diagnostics_launcher(dir:&std::path::Path)->std::io::Result<PathBuf>{
-    let scripts=dir.join("scripts");
-    std::fs::create_dir_all(&scripts)?;
-    crate::model::atomic_write(&scripts.join("collect-diagnostics.ps1"),include_bytes!("../scripts/collect-diagnostics.ps1"))?;
-    let launcher=dir.join("收集岛仔诊断.cmd");
-    crate::model::atomic_write(&launcher,include_bytes!("../收集岛仔诊断.cmd"))?;
-    Ok(launcher)
-}
-
 /// 只统计岛仔自己的文件（KB）。共享安装文件夹里的其他软件不算在内。
+/// 诊断脚本已内嵌在程序里（`--collect-diagnostics`），安装目录不再附带单独的诊断文件。
 fn own_files_kb(dir: &std::path::Path) -> u32 {
-    let bytes: u64 = ["daozai.exe", "Uninstall.exe", "LICENSE", "THIRD_PARTY_NOTICES.txt","收集岛仔诊断.cmd","scripts/collect-diagnostics.ps1"].iter()
+    let bytes: u64 = ["daozai.exe", "Uninstall.exe", "LICENSE", "THIRD_PARTY_NOTICES.txt"].iter()
         .filter_map(|name| std::fs::metadata(dir.join(name)).ok()).filter(|meta| meta.is_file()).map(|meta| meta.len()).sum();
     bytes.div_ceil(1024).min(u64::from(u32::MAX)) as u32
 }
@@ -469,18 +460,6 @@ fn parse_release(value: &serde_json::Value, current: &str) -> Result<Option<Stri
 
 #[cfg(test)]
 mod install_size_tests {
-    #[test]
-    fn exe_only_upgrade_can_restore_both_diagnostic_tools(){
-        let dir=std::env::temp_dir().join(format!("daozai-diagnostic-tools-{}",std::process::id()));
-        let launcher=super::diagnostics_launcher(&dir).unwrap();
-        let script=dir.join("scripts/collect-diagnostics.ps1");
-        assert_eq!(std::fs::read(&launcher).unwrap(),include_bytes!("../收集岛仔诊断.cmd").as_slice());
-        std::fs::write(&script,b"old").unwrap();
-        super::diagnostics_launcher(&dir).unwrap();
-        assert_eq!(std::fs::read(&script).unwrap(),include_bytes!("../scripts/collect-diagnostics.ps1").as_slice());
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
     #[test]
     fn install_size_counts_only_daozai_files() {
         let dir = std::env::temp_dir().join(format!("daozai-size-{}", std::process::id()));

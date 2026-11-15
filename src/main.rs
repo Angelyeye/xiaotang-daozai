@@ -1000,6 +1000,14 @@ mod open_path_tests {
 
 fn main() -> std::process::ExitCode {
     diagnostics::install();
+    // 收集诊断：在单实例检查、创建窗口和初始化显卡之前处理，岛仔启动即崩溃、卡死时也能用。
+    #[cfg(windows)]
+    if daozai::diagnostics_tool::requested(std::env::args()) {
+        return match daozai::diagnostics_tool::run(&daozai::model::config_dir()) {
+            Ok(_) => std::process::ExitCode::SUCCESS,
+            Err(error) => {diagnostics::report("诊断收集未完成。", &error); std::process::ExitCode::FAILURE}
+        };
+    }
     match run() {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {

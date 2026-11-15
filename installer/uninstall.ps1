@@ -6,7 +6,7 @@ Get-Process daozai -ErrorAction SilentlyContinue | Where-Object {$_.Path -eq $ex
     $null=$_.CloseMainWindow();if(-not $_.WaitForExit(3000)){Stop-Process -Id $_.Id}
 }
 $shell=New-Object -ComObject WScript.Shell
-$links=@((Join-Path $shell.SpecialFolders.Item('Desktop') '岛仔.lnk'),(Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\岛仔.lnk'),(Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\岛仔设置.lnk'))
+$links=@((Join-Path $shell.SpecialFolders.Item('Desktop') '岛仔.lnk'),(Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\岛仔.lnk'),(Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\岛仔设置.lnk'),(Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\收集岛仔诊断.lnk'))
 foreach($path in $links){if((Test-Path -LiteralPath $path) -and $shell.CreateShortcut($path).TargetPath -eq $exePath){Remove-Item -LiteralPath $path}}
 $runKey='HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 Remove-ItemProperty -Path $runKey -Name Daozai -ErrorAction SilentlyContinue

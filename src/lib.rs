@@ -6,6 +6,7 @@
 //! - `native` / `tray`：仅 Windows 的窗口区域、命中穿透与托盘
 
 pub mod display_layout;
+pub mod diagnostics_tool;
 mod mail_privacy;
 pub mod poll_clock;
 pub mod resources;

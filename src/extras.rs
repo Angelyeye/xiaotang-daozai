@@ -2062,10 +2062,8 @@ impl App {
                             ui.horizontal_wrapped(|ui|{
                                 if ui.button("打开本地数据目录").clicked(){self.pending.push(Cmd::Open(crate::model::config_dir()));}
                                 if ui.button("收集诊断").clicked(){
-                                    match crate::updates::diagnostics_launcher(&crate::model::config_dir().join("诊断工具")){
-                                        Ok(path)=>self.pending.push(Cmd::Open(path)),
-                                        Err(_)=>self.say("无法写入诊断工具，请检查本地数据目录是否可写"),
-                                    }
+                                    // 另起 `daozai.exe --collect-diagnostics`：在新窗口里收集，诊断包保存到桌面并自动选中。
+                                    if crate::diagnostics_tool::launch().is_err(){self.say("无法启动诊断收集，请从开始菜单打开「收集岛仔诊断」");}
                                 }
                                 ui.label(egui::RichText::new("设备图标：Solar Icons · 480 Design").size(11.0).color(settings_color(ctx,Color32::from_gray(150),Color32::from_gray(105))));
                                 ui.hyperlink_to("CC BY 4.0", "https://creativecommons.org/licenses/by/4.0/");

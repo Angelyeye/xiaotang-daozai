@@ -42,11 +42,9 @@ try {
     @('LICENSE','THIRD_PARTY_NOTICES.txt') | ForEach-Object {
         Copy-Item -LiteralPath (Join-Path $projectRoot $_) -Destination $stagingDirectory -Recurse
     }
-    # 诊断工具随包附带：用户遇到问题时双击即可在桌面生成诊断包，不必另外索取脚本。
-    # cmd 按相对路径调用 scripts\collect-diagnostics.ps1，两者必须保持这个目录结构。
-    Copy-Item -LiteralPath (Join-Path $projectRoot '收集岛仔诊断.cmd') -Destination $stagingDirectory
-    $toolsDirectory = New-Item -ItemType Directory -Path (Join-Path $stagingDirectory 'scripts')
-    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'collect-diagnostics.ps1') -Destination $toolsDirectory.FullName
+    # 免安装包没有开始菜单：附带一个只调用 daozai.exe --collect-diagnostics 的 cmd，岛仔打不开时双击收集。
+    # 诊断脚本本身内嵌在程序里，不再单独附带，也就不会出现新程序配旧脚本。
+    Copy-Item -LiteralPath (Join-Path $projectRoot 'installer\收集岛仔诊断.cmd') -Destination $stagingDirectory
     $setup = Join-Path $outputDirectory "Daozai-Setup-v$version-x64.exe"
     & $NsisCompiler /V2 /WX "/DAPP_VERSION=$version" "/DPROJECT_DIR=$projectRoot" "/DSOURCE_EXE=$($binary.FullName)" "/DOUTPUT_FILE=$setup" (Join-Path $projectRoot 'installer\setup.nsi')
     if ($LASTEXITCODE -ne 0) { throw 'Installer build failed' }

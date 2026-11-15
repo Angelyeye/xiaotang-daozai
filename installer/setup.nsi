@@ -257,11 +257,10 @@ Section "安装"
   File /oname=daozai.exe "${SOURCE_EXE}"
   File "${PROJECT_DIR}\LICENSE"
   File "${PROJECT_DIR}\THIRD_PARTY_NOTICES.txt"
-  ; 诊断工具：cmd 按相对路径调用 scripts\collect-diagnostics.ps1，保持同样的目录结构。
-  File "${PROJECT_DIR}\收集岛仔诊断.cmd"
-  SetOutPath "$INSTDIR\scripts"
-  File "${PROJECT_DIR}\scripts\collect-diagnostics.ps1"
-  SetOutPath "$INSTDIR"
+  ; 诊断脚本已内嵌在程序里（daozai.exe --collect-diagnostics），清掉测试版留下的单独诊断文件。
+  Delete "$INSTDIR\收集岛仔诊断.cmd"
+  Delete "$INSTDIR\scripts\collect-diagnostics.ps1"
+  RMDir "$INSTDIR\scripts"
   WriteUninstaller "$INSTDIR\Uninstall.exe"
   ${If} $DesktopChoice == 1
     CreateShortcut "$DESKTOP\${APP_NAME}.lnk" "$INSTDIR\daozai.exe"
@@ -275,7 +274,8 @@ Section "安装"
   ${EndIf}
   CreateShortcut "$SMPROGRAMS\${APP_NAME}.lnk" "$INSTDIR\daozai.exe"
   CreateShortcut "$SMPROGRAMS\${APP_NAME}设置.lnk" "$INSTDIR\daozai.exe" "--settings"
-  CreateShortcut "$SMPROGRAMS\收集${APP_NAME}诊断.lnk" "$INSTDIR\收集岛仔诊断.cmd" "" "$INSTDIR\daozai.exe" 0
+  ; 岛仔打不开、卡死时的备用入口；能打开时用「设置 → 关于 → 收集诊断」。
+  CreateShortcut "$SMPROGRAMS\收集${APP_NAME}诊断.lnk" "$INSTDIR\daozai.exe" "--collect-diagnostics" "$INSTDIR\daozai.exe" 0
   WriteRegStr HKCU "${UNINSTALL_KEY}" "DisplayName" "${APP_NAME} Daozai"
   WriteRegStr HKCU "${UNINSTALL_KEY}" "DisplayVersion" "${APP_VERSION}"
   WriteRegStr HKCU "${UNINSTALL_KEY}" "Publisher" "岛仔"
@@ -290,8 +290,6 @@ Section "安装"
   ${GetSize} "$INSTDIR" "/M=Uninstall.exe /S=0K /G=0" $3 $1 $2
   IntOp $0 $0 + $3
   ${GetSize} "$INSTDIR" "/M=THIRD_PARTY_NOTICES.txt /S=0K /G=0" $3 $1 $2
-  IntOp $0 $0 + $3
-  ${GetSize} "$INSTDIR\scripts" "/M=collect-diagnostics.ps1 /S=0K /G=0" $3 $1 $2
   IntOp $0 $0 + $3
   IntOp $0 $0 + 8
   WriteRegDWORD HKCU "${UNINSTALL_KEY}" "EstimatedSize" $0
