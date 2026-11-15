@@ -300,6 +300,10 @@ impl Shell {
                 #[cfg(windows)] {daozai::system::screen_locked()}
                 #[cfg(not(windows))] {false}
             },
+            fullscreen_hidden: {
+                #[cfg(windows)] {self.hidden}
+                #[cfg(not(windows))] {false}
+            },
             browser_at_top: {
                 #[cfg(windows)] {if self.app.settings.browser_minimal {self.native.as_mut().and_then(|native|native.browser_at_top(&self.app.settings))}else{None}}
                 #[cfg(not(windows))] {None}

@@ -3,7 +3,7 @@
 //!
 //! 时间一律来自 `Env::t`（秒），不直接读系统时钟，所以录屏可逐帧复现。
 
-use crate::extras::{Alert, PetState};
+use crate::extras::{Alert, HealthReminder, PetState};
 use crate::anim::{self, lerp, smoothstep, Spring};
 use crate::bar_layout::{self as bar, Layout};
 use crate::calendar;
@@ -27,9 +27,6 @@ pub const FOCUS_PAGE: usize = 1;
 pub const WATER_PAGE: usize = 2;
 /// 久坐提醒的标题（通知按钮据此区分喝水提醒）。
 pub const SIT_TITLE: &str = "该起来活动了";
-/// 连续无键鼠输入多久算作「起身离开」，久坐计时随之归零。
-/// 「稍后」把久坐提醒推迟的秒数。
-pub const SIT_SNOOZE_SECS: f64 = 10.0 * 60.0;
 
 pub const SHELF_PAGE: usize = 3;
 pub const TODO_PAGE: usize = 4;
@@ -131,6 +128,8 @@ pub struct Env {
     pub idle_seconds: Option<f64>,
     /// 当前会话是否处于锁屏（Win + L、自动锁屏、唤醒后的登录界面）。
     pub screen_locked: bool,
+    /// 因「全屏时隐藏」而隐藏岛体，沿用外壳对设置和所在屏幕的判断。
+    pub fullscreen_hidden: bool,
     /// 前台浏览器的顶部是否与岛重叠；岛仔自身窗口或暂不可读时为 None。
     pub browser_at_top: Option<bool>,
     pub media: NowPlaying,
@@ -767,14 +766,15 @@ pub struct App {
     pub(crate) health_time: bool,
     pub(crate) remind_t: Spring,
     pub(crate) last_reminder: f64,
-    /// 久坐计时起点（离开电脑足够久后重置）与上次久坐提醒时刻。
+    pub(crate) health_pending: [bool;2],
+    pub(crate) fullscreen_hidden: bool,
+    /// 久坐计时起点，确认提醒或点「起身了」后重置。
     pub(crate) sit_start: f64,
-    pub(crate) sit_alerted: f64,
     pub(crate) sit_t: Spring,
 
     // 专注
     pub(crate) pomo: Pomo,
-    pub(crate) focus_editing: bool,
+    pub(crate) settings_editing: bool,
     pub(crate) ring_shown: Spring,
     pub(crate) reset_spin: Spring,
 
@@ -949,10 +949,11 @@ impl App {
             health_time: false,
             remind_t: Spring::new(1.0, 400.0, 0.8),
             last_reminder: 0.0,
+            health_pending: model::load_health_pending(),
+            fullscreen_hidden: false,
             sit_start: 0.0,
-            sit_alerted: f64::NEG_INFINITY,
             sit_t: Spring::new(1.0, 400.0, 0.8),
-            pomo: Pomo { phase: Phase::Focus, remaining: focus_seconds, running: false }, focus_editing:false,
+            pomo: Pomo { phase: Phase::Focus, remaining: focus_seconds, running: false }, settings_editing:false,
             ring_shown: Spring::new(1.0, 160.0, 0.95),
             reset_spin: Spring::new(0.0, 160.0, 0.82),
             adding: false,
@@ -1586,7 +1587,7 @@ impl App {
     }
 
     pub fn is_editing(&self) -> bool {
-        self.adding || self.editing.is_some() || self.todo_choosing || self.task_dialog.is_some() || self.calendar.draft.is_some() || self.focus_editing
+        self.adding || self.editing.is_some() || self.todo_choosing || self.task_dialog.is_some() || self.calendar.draft.is_some() || self.settings_editing
     }
 
     pub fn filter_todo_input(&mut self,input:&mut egui::RawInput) {
@@ -1638,7 +1639,7 @@ impl App {
     }
 
     pub(crate) fn cancel_edit(&mut self) {
-        self.focus_editing=false;
+        self.settings_editing=false;
         self.adding = false;
         self.editing = None;
         self.todo_choosing = false;
@@ -1732,7 +1733,7 @@ impl App {
         }
         if self.side() {
             // 左右停靠：竖向胶囊（通知仍是贴边滑出的横向卡片，见上）。
-            return self.side_base_size(self.effective_minimal()&&self.t>=self.notification_bell_until&&(self.browser_minimal_active||self.pending_messengers.is_empty()));
+            return self.side_base_size(self.effective_minimal()&&self.t>=self.notification_bell_until&&(self.browser_minimal_active||self.unread_count()==0));
         }
         if self.island_lyrics_active() {
             (self.lyric_bar_width(),BAR_H)
@@ -1770,6 +1771,7 @@ impl App {
         let elapsed = self.last_t.map(|at| (env.t - at).max(0.0) as f32).unwrap_or(0.0);
         self.last_t = Some(env.t);
         self.t = env.t;
+        self.fullscreen_hidden=env.fullscreen_hidden;
         self.quota_tick();
         self.weather_tick();
         self.current_hour=env.hour();
@@ -2037,7 +2039,7 @@ impl App {
                     c.circle(22.0,10.5,2.0,Color32::from_rgb(255,72,72));
                 }else{crate::extras::notice_badge(&c,18.0,15.0,&a);}
                 let button=crate::quota_ui::bar_tooltip(c.hit(0.0,0.0,36.0,BAR_H,"notice-badge"),format!("{}\n{}",a.title,a.body));
-                if button.clicked(){self.notice_details=!self.notice_details;}
+                if button.clicked(){if let Some(kind)=a.health(){self.confirm_health_reminder(kind);}else{self.notice_details=!self.notice_details;}}
             }else if self.t<self.notification_bell_until {
                 paint::bell(&c.scaled(20.0,14.0,1.2),20.0,14.0,theme::WHITE,paint::bell_swing(self.t-self.notification_bell_at));
                 c.circle(24.0,9.5,2.0,Color32::from_rgb(255,72,72));
@@ -2243,13 +2245,14 @@ impl App {
     }
     /// 展开胶囊高度：一个是圆，两个是短胶囊，三个及以上与面板等高（多出的滚动）。
     fn unread_capsule_height(&self,panel_h:f32)->f32 {
-        let n=self.pending_messengers.len();
+        let n=self.unread_count();
         if n>=3 {panel_h} else {4.0+UNREAD_SLOT*n as f32}
     }
     pub(crate) fn unread_top_inset(&self)->f32 {if self.dock()==model::Dock::Top {UNREAD_GAP}else{0.0}}
     fn unread_slot(&self,height:f32)->f32 {
-        if self.pending_messengers.len()>=3 {(height-4.0)/3.0} else {UNREAD_SLOT}
+        if self.unread_count()>=3 {(height-4.0)/3.0} else {UNREAD_SLOT}
     }
+    fn unread_count(&self)->usize {self.pending_messengers.len()+self.health_badges().len()}
     /// 收起时叠放的来源图标，每个客户端各占一个。
     fn unread_sources(&self)->Vec<Messenger>{
         let mut sources=Vec::new();
@@ -2258,14 +2261,14 @@ impl App {
     }
     /// 收起时叠放区沿胶囊方向的长度。
     fn unread_stack_len(&self,horizontal:bool)->f32 {
-        let icons=self.unread_sources().len() as f32;
+        let icons=(self.unread_sources().len()+self.health_badges().len()) as f32;
         32.0+unread_step(horizontal)*(icons-1.0)
     }
 
     fn messenger_badge_rect(&self,win:Rect,panel:Rect)->Option<Rect>{
-        if self.pending_messengers.is_empty() || self.browser_minimal_active && !self.open {return None;}
+        if self.unread_count()==0 || self.browser_minimal_active && !self.open {return None;}
         // 完整横幅已包含该来源图标。歌词模式和横幅收起后使用常驻入口。
-        if !self.open && !self.compact_notices() && self.pending_messengers.len()==1
+        if !self.open && !self.compact_notices() && self.pending_messengers.len()==1 && self.health_badges().is_empty()
             && self.notice.as_ref().and_then(|a|a.messenger())==self.pending_messengers.first().map(|u|u.source){return None;}
         let bounds=self.screen.map_or(win,|screen|screen.intersect(win));
         let appear=self.messenger_appear();
@@ -2300,7 +2303,7 @@ impl App {
 
     /// 展开后的未读胶囊：每个账号一个图标，点击跳到对应窗口；超过三个时滚轮翻看。
     fn draw_unread_capsule(&mut self,ctx:&egui::Context,c:&Card,rect:Rect,cursor:Option<Pos2>,cmds:&mut Vec<Cmd>){
-        let n=self.pending_messengers.len();
+        let n=self.unread_count();
         let height=rect.height()/c.s;
         let slot=self.unread_slot(height);
         let max_scroll=(n as f32-3.0).max(0.0)*slot;
@@ -2312,7 +2315,7 @@ impl App {
         let c=c.faded(self.messenger_appear());
         let inner=c.clipped(0.0,2.0,UNREAD_W,height-4.0);
         let x=UNREAD_W/2.0;
-        for i in 0..n {
+        for i in 0..self.pending_messengers.len() {
             let u=self.pending_messengers[i];
             let cy=2.0+slot*(i as f32+0.5)-self.messenger_scroll;
             if cy< -slot || cy>height+slot {continue;}
@@ -2329,6 +2332,14 @@ impl App {
             let button=inner.hit(0.0,cy-slot/2.0,UNREAD_W,slot,self.unread_id(i)).on_hover_text(format!("查看{name}"));
             if button.clicked(){cmds.push(Cmd::ViewMessenger(u));}
         }
+        for (i,kind) in self.health_badges().into_iter().enumerate() {
+            let cy=2.0+slot*((self.pending_messengers.len()+i) as f32+0.5)-self.messenger_scroll;
+            if cy< -slot || cy>height+slot {continue;}
+            kind.icon(&inner,x,cy,0.8);
+            inner.circle(x+10.0,cy-9.0,2.6,Color32::from_rgb(255,59,48));
+            let button=crate::quota_ui::bar_tooltip(inner.hit(0.0,cy-slot/2.0,UNREAD_W,slot,kind.id().to_string()),format!("{} · 点击确认，重新计时",kind.label()));
+            if button.clicked(){self.confirm_health_reminder(kind);}
+        }
         if max_scroll>0.0 {
             // 还有没露出的图标：上下边缘各一条淡淡的指示。
             let ink=paint::alpha(theme::WHITE,0.35);
@@ -2340,25 +2351,37 @@ impl App {
     /// 收起时的未读入口：每个来源一个图标加小红点（同一来源多个账号合成一个）。只有一条时点它直接跳转，多条时展开面板挑选。
     fn draw_unread_stack(&mut self,c:&Card,horizontal:bool,cmds:&mut Vec<Cmd>){
         let sources=self.unread_sources();
+        let health=self.health_badges();
         let count=self.pending_messengers.len();
-        let icons=sources.len();
+        let icons=sources.len()+health.len();
         let step=unread_step(horizontal);
         let at=|k:usize|if horizontal {(16.0+step*k as f32,14.0)}else{(16.0,14.0+step*k as f32)};
-        for k in 0..icons {
+        for k in 0..sources.len() {
             let (x,y)=at(k);
             let scale=sources[k].adapter().collapsed_icon_scale;
             crate::extras::messenger_icon(&c.scaled(x,y,scale),x,y,sources[k]);
         }
+        for (i,kind) in health.iter().enumerate(){let (x,y)=at(sources.len()+i);kind.icon(c,x,y,0.7);}
         // 每个来源图标右上角一个小红点，不显示数字。
         for k in 0..icons {let (x,y)=at(k);c.circle(x+8.0,y-7.0,2.6,Color32::from_rgb(255,59,48));}
-        let (w,h)=if horizontal {(self.unread_stack_len(true),BAR_H)}else{(32.0,self.unread_stack_len(false))};
+        let length=self.unread_stack_len(horizontal);
+        let messenger_length=if health.is_empty(){length}else{sources.len() as f32*step+if horizontal{5.0}else{3.0}};
+        let (w,h)=if horizontal {(messenger_length,BAR_H)}else{(32.0,messenger_length)};
         if count==1 {
             let u=self.pending_messengers[0];
             let button=c.hit(0.0,0.0,w,h,u.source.name()).on_hover_text(format!("查看{}",u.source.name()));
             if button.clicked(){cmds.push(Cmd::ViewMessenger(u));}
-        }else{
+        }else if count>1 {
             let button=c.hit(0.0,0.0,w,h,"messenger-stack").on_hover_text(format!("{count} 条未读 · 展开挑选"));
             if button.clicked(){self.reveal_unread();}
+        }
+        for (i,kind) in health.into_iter().enumerate() {
+            let k=sources.len()+i;
+            let (x,y)=at(k);
+            let start=if k==0{0.0}else{(if horizontal{x}else{y})-step/2.0};
+            let end=if k+1==icons{length}else{(if horizontal{x}else{y})+step/2.0};
+            let button=if horizontal{c.hit(start,0.0,end-start,BAR_H,kind.id().to_string())}else{c.hit(0.0,start,32.0,end-start,kind.id().to_string())};
+            if crate::quota_ui::bar_tooltip(button,format!("{} · 点击确认，重新计时",kind.label())).clicked(){self.confirm_health_reminder(kind);}
         }
     }
     /// 展开面板，让旁边的未读胶囊露出来。
@@ -2950,7 +2973,7 @@ impl App {
             else {c.text(37.0,25.0,"专注设置",size::TITLE,W::Bold,theme::WHITE,H::Left);}
             // 「提醒时段」二级页的返回先回到健康提醒设置，再退出设置。
             if c.hit(9.0,7.0,28.0,23.0,"subpage-back").clicked(){
-                if self.page==2 && self.health_time {self.health_time=false;} else {self.subpage=None;self.focus_editing=false;}
+                if self.page==2 && self.health_time {self.health_time=false;} else {self.subpage=None;self.settings_editing=false;}
             }
             self.page_settings(c);self.nav(c);return;
         }
@@ -3082,7 +3105,7 @@ impl App {
         if env.today != self.today {
             self.today = env.today.clone();
             self.water = model::Water::load(&env.today);
-            self.last_drink=None;self.last_reminder=self.t;
+            self.last_drink=None;
             self.water_ml = self.water.drunk_ml as f32;
             self.water_ring.snap(self.water.percent() / 100.0);
         }
@@ -3108,18 +3131,13 @@ impl App {
         self.reset_spin.step(dt);
         self.todo_pop.step(dt);
 
-        if self.module_on(WATER_PAGE) && self.water.remind && self.water.percent() < 100.0 && self.remind_window(env) && self.t - self.last_reminder >= self.settings.water_minutes as f64 * 60.0 {
-            self.last_reminder = self.t;
+        if self.module_on(WATER_PAGE) && self.water.remind && !self.health_pending[HealthReminder::Water as usize] && self.water.percent() < 100.0 && self.remind_window(env) && self.t - self.last_reminder >= self.settings.water_minutes as f64 * 60.0 {
             self.alert("喝水时间到了", format!("休息一下，喝 {} ml 水吧", self.settings.serving_ml), 2, true);
         }
-        // 久坐：锁屏视为已起身离开，锁屏期间计时一直停在零，解锁后从头算；
-        // 不看键盘鼠标是否闲置——只看屏幕不动鼠标的人同样是在久坐。
         // 专注阶段不打断，等专注结束（通常正好进入休息）再提醒。
-        if env.screen_locked { self.sit_start = self.t; }
         let focusing = self.pomo.running && self.pomo.phase == Phase::Focus;
-        if self.module_on(WATER_PAGE) && self.settings.sit_remind && !focusing && self.remind_window(env) && self.t >= self.sit_due() {
-            self.sit_alerted = self.t;
-            self.alert(SIT_TITLE, format!("已连续坐了 {} 分钟", self.sat_minutes()), 2, true);
+        if self.module_on(WATER_PAGE) && self.settings.sit_remind && !self.health_pending[HealthReminder::Sit as usize] && !focusing && self.remind_window(env) && self.t >= self.sit_due() {
+            self.alert(SIT_TITLE, "起来走走，休息一下", 2, true);
         }
         let now = format!("{} {}", env.today, env.clock.get(..5).unwrap_or("00:00"));
         let todo_on=self.module_on(TODO_PAGE);

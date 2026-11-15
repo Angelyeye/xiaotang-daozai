@@ -10,6 +10,8 @@ mod doubao;
 mod weather_source;
 #[path="lyrics_switch_ui_tests.rs"]
 mod lyrics_switch;
+#[path="health_reminder_ui_tests.rs"]
+mod health_reminder;
 use eframe::egui::{self, Pos2, Rect, Vec2};
 use std::sync::Mutex;
 
@@ -1115,6 +1117,7 @@ struct H {
     network: Option<bool>,
     system_idle: Option<f64>,
     screen_locked: bool,
+    fullscreen: bool,
     browser_at_top: Option<bool>,
     file_drop_zone:Option<Rect>,
     hovered_files:Vec<egui::HoveredFile>,
@@ -1127,7 +1130,7 @@ impl H {
         std::env::set_var("DAOZAI_DATA_DIR", &dir);
         let ctx = egui::Context::default();
         let app = App::new(&ctx, Options { fetch_lyrics: false, pet_idle: 1e9 });
-        Self { ctx, app, t: 0.0, cursor: None,cmds:vec![],region:Rect::NOTHING,hit:Rect::NOTHING,animating:false,shapes:Vec::new(), bt:Vec::new(),media:Default::default(),power:(None,false),network:None,system_idle:None,screen_locked:false,browser_at_top:None,file_drop_zone:None,hovered_files:vec![],dropped_files:vec![] }
+        Self { ctx, app, t: 0.0, cursor: None,cmds:vec![],region:Rect::NOTHING,hit:Rect::NOTHING,animating:false,shapes:Vec::new(), bt:Vec::new(),media:Default::default(),power:(None,false),network:None,system_idle:None,screen_locked:false,fullscreen:false,browser_at_top:None,file_drop_zone:None,hovered_files:vec![],dropped_files:vec![] }
     }
     fn frame(&mut self, events: Vec<egui::Event>) {
         self.t += 1.0 / 60.0;
@@ -1155,6 +1158,7 @@ impl H {
             network:self.network,
             idle_seconds:self.system_idle,
             screen_locked:self.screen_locked,
+            fullscreen_hidden:self.fullscreen && self.app.settings.hide_fullscreen,
             browser_at_top:self.browser_at_top,
             ..Default::default()
         };
@@ -3968,7 +3972,7 @@ fn lunch_break_silences_water_and_sit_reminders(){
     h.frame(vec![]);assert!(h.app.notice.is_none(),"午休中不应弹喝水或久坐提醒");
     h.app.settings.lunch_rest=false;h.frame(vec![]);
     assert!(h.app.notice.is_some(),"关闭午休后应恢复提醒");
-    h.app.notice=None;h.app.alerts.clear();h.app.water.remind=false;h.app.sit_alerted=f64::NEG_INFINITY;
+    h.app.notice=None;h.app.alerts.clear();h.app.water.remind=false;h.app.confirm_health_reminder(crate::extras::HealthReminder::Sit);h.app.sit_start=h.t-2.0*3600.0;
     h.app.settings.lunch_rest=true;h.app.settings.lunch_start=10*60;h.app.settings.lunch_end=13*60;
     h.frame(vec![]);assert!(h.app.notice.as_ref().is_some_and(|a|a.title==SIT_TITLE),"午休以外照常提醒");
 }
@@ -3982,7 +3986,7 @@ fn health_time_subpage_edits_lunch_and_backs_out_one_level(){
     h.hover(H::local(300.0,60.0),0.3);h.click(H::local(20.0,18.0));assert!(!h.app.health_time);assert_eq!(h.app.subpage,Some(2),"返回先回到健康提醒设置");
 }
 #[test]
-fn sit_reminder_fires_after_continuous_use_snoozes_and_resets_when_away(){
+fn sit_reminder_waits_for_confirmation_before_restarting(){
     use crate::app::SIT_TITLE;
     let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());let mut h=H::new();
     h.system_idle=Some(0.0);h.frame(vec![]);h.app.water.remind=false;
@@ -3990,16 +3994,12 @@ fn sit_reminder_fires_after_continuous_use_snoozes_and_resets_when_away(){
     h.t+=61.0;h.frame(vec![]);
     assert!(h.app.notice.as_ref().is_some_and(|a|a.title==SIT_TITLE));
     assert!(h.cmds.iter().any(|c|matches!(c,crate::app::Cmd::Notify(t,_)if t==SIT_TITLE)));
-    // 稍后：10 分钟内不再提醒
-    h.app.notice=None;h.app.snooze_sit();h.t+=9.0*60.0;h.frame(vec![]);assert!(h.app.notice.is_none());
+    let count=h.app.history.len();
+    h.screen_locked=true;h.system_idle=Some(40.0*60.0);h.t+=500.0*60.0;h.frame(vec![]);
+    assert!(h.app.notice.is_none());assert_eq!(h.app.history.len(),count,"锁屏和长时间未处理都只保留一次提醒");
+    h.app.confirm_health_reminder(crate::extras::HealthReminder::Sit);assert_eq!(h.app.sat_minutes(),0);
+    h.screen_locked=false;h.system_idle=Some(0.0);h.t+=59.0*60.0;h.frame(vec![]);assert!(h.app.notice.is_none());
     h.t+=61.0;h.frame(vec![]);assert!(h.app.notice.as_ref().is_some_and(|a|a.title==SIT_TITLE));
-    // 不理会：从上次提醒再满一个周期才再次提醒
-    h.app.notice=None;h.t+=30.0*60.0;h.frame(vec![]);assert!(h.app.notice.is_none());
-    // 只看屏幕不碰键鼠：照样算久坐，不归零
-    h.system_idle=Some(40.0*60.0);h.t+=10.0*60.0;h.frame(vec![]);assert!(h.app.sat_minutes()>=100,"键鼠闲置不应清零久坐计时");
-    // 锁屏：计时归零，解锁后从头算
-    h.app.notice=None;h.screen_locked=true;h.t+=60.0;h.frame(vec![]);assert_eq!(h.app.sat_minutes(),0);
-    h.screen_locked=false;h.system_idle=Some(0.0);h.t+=45.0*60.0;h.frame(vec![]);assert!(h.app.notice.is_none());assert_eq!(h.app.sat_minutes(),45);
 }
 #[test]
 fn sit_reminder_waits_for_focus_and_stops_with_module_or_switch(){
@@ -4017,7 +4017,7 @@ fn sit_notice_and_page_buttons_reset_the_timer(){
     use crate::app::SIT_TITLE;
     let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());let mut h=H::new();h.system_idle=Some(0.0);h.frame(vec![]);
     h.app.sit_start=h.t-70.0*60.0;h.app.alert(SIT_TITLE,"已连续坐了 70 分钟",2,false);for _ in 0..60 {h.frame(vec![]);}
-    h.click_text("稍后");assert!(h.app.notice.is_none());assert!((h.app.sit_due()-h.t-600.0).abs()<5.0);assert_eq!(h.app.water.drunk_ml,0);
+    h.click_text("知道了");assert!(h.app.notice.is_none());assert!((h.app.sit_due()-h.t-3600.0).abs()<5.0);assert_eq!(h.app.water.drunk_ml,0);
     h.app.alert(SIT_TITLE,"已连续坐了 70 分钟",2,false);for _ in 0..60 {h.frame(vec![]);}
     h.click_text("起身了");assert!(h.app.notice.is_none());assert_eq!(h.app.sat_minutes(),0);assert_eq!(h.app.water.drunk_ml,0);
     // 健康页：点「久坐」分段切换，同一位置的主按钮变成「起身了」、开关管久坐；点「喝水」切回

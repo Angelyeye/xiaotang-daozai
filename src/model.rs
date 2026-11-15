@@ -47,6 +47,21 @@ fn write_kv(path: &Path, pairs: &[(String, String)]) -> std::io::Result<()> {
     atomic_write(path, body.as_bytes())
 }
 
+pub(crate) fn load_health_pending()->[bool;2] {
+    let mut pending=[false;2];
+    for (key,value) in read_kv(&config_dir().join("health-pending.txt")) {
+        match key.as_str() {"water"=>pending[0]=value=="1","sit"=>pending[1]=value=="1",_=>{}}
+    }
+    pending
+}
+
+pub(crate) fn save_health_pending(pending:[bool;2]) {
+    let _=write_kv(&config_dir().join("health-pending.txt"),&[
+        ("water".into(),u8::from(pending[0]).to_string()),
+        ("sit".into(),u8::from(pending[1]).to_string()),
+    ]);
+}
+
 pub(crate) fn atomic_write(path:&Path,body:&[u8])->std::io::Result<()> {
     use std::io::Write;
     use std::sync::atomic::{AtomicU64,Ordering};
