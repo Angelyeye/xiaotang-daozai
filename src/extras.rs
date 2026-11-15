@@ -284,6 +284,11 @@ impl App {
         if !source.adapter().keep_unidentified{self.clear_account_notices(source,0);}
         if !self.pending_messengers.iter().any(|u|u.source==source){self.clear_messenger_notices(source);}
     }
+    pub fn confirm_messenger_open(&mut self,unread:crate::app::Unread,foreground:Option<(crate::app::Messenger,u32)>)->bool{
+        if unread.pid==0 || foreground!=Some((unread.source,unread.pid)){return false;}
+        self.viewed_client(unread.source,unread.pid);
+        true
+    }
     pub fn discard_unread(&mut self,unread:crate::app::Unread){
         if !self.pending_messengers.contains(&unread){return;}
         self.pending_messengers.retain(|current|*current!=unread);
