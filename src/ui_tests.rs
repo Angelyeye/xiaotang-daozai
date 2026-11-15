@@ -7219,6 +7219,33 @@ fn side_dock_stacks_ai_quota_and_opens_the_account(){
 }
 
 #[test]
+fn minimal_side_pill_returns_to_line_while_wechat_is_unread(){
+    use crate::model::{Dock,IslandShape};
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    for dock in [Dock::Right,Dock::Left] {
+        let mut h=H::new();
+        h.app.settings.dock=dock;
+        h.app.settings.island_shape=IslandShape::Pill;
+        h.app.settings.minimal=true;
+        h.app.settings.wechat_notifications=true;
+        for _ in 0..90 {side_frame_with(&mut h,None);}
+        let idle=side_frame_with(&mut h,None);
+        h.app.receive_wechat_reminder_from(4242,0x1234);
+        for _ in 0..30 {side_frame_with(&mut h,None);}
+        assert_eq!(h.app.notice.as_ref().and_then(|a|a.messenger()),Some(crate::app::Messenger::Wechat));
+        for _ in 0..480 {side_frame_with(&mut h,None);}
+        let collapsed=side_frame_with(&mut h,None);
+        assert!(h.app.notice.is_none() && collapsed.notice_hit.is_none());
+        assert_eq!(h.app.pending_messengers.len(),1);
+        assert_eq!(collapsed.hit,idle.hit,"{dock:?} 有未读时也应收回细线");
+        assert_eq!(collapsed.region,idle.region);
+        let edge=Some(idle.hit.center());
+        for _ in 0..90 {side_frame_with(&mut h,edge);}
+        assert!(h.app.open && side_frame_with(&mut h,edge).notice_hit.is_some());
+    }
+}
+
+#[test]
 fn automatic_minimal_hides_unread_hit_area_until_reopened(){
     let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
     for dock in [crate::model::Dock::Top,crate::model::Dock::Left,crate::model::Dock::Right] {

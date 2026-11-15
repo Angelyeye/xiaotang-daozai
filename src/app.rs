@@ -1733,7 +1733,7 @@ impl App {
         }
         if self.side() {
             // 左右停靠：竖向胶囊（通知仍是贴边滑出的横向卡片，见上）。
-            return self.side_base_size(self.effective_minimal()&&self.t>=self.notification_bell_until&&(self.browser_minimal_active||self.unread_count()==0));
+            return self.side_base_size(self.effective_minimal()&&self.t>=self.notification_bell_until);
         }
         if self.island_lyrics_active() {
             (self.lyric_bar_width(),BAR_H)
