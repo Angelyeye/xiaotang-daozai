@@ -143,6 +143,94 @@ impl CoverCache {
     }
 }
 
+/// 本地日志和队列都没有歌名时（漫游、私人 FM 续载、每日推荐等网易云不落盘的歌），按歌曲 ID 在线查一次。
+/// 只保留当前这首；请求在后台进行，不占媒体轮询线程；失败按 10 秒、60 秒再试，第三次失败后这首歌不再请求。
+#[derive(Default)]
+pub(super) struct DetailCache {
+    id:Option<u64>,value:Option<(NowPlaying,String)>,failures:usize,retry_at:Option<Instant>,
+    pending:Option<mpsc::Receiver<Option<(NowPlaying,String)>>>,
+    worker:Option<std::thread::JoinHandle<()>>,
+}
+const DETAIL_RETRY:[Duration;2]=[Duration::from_secs(10),Duration::from_secs(60)];
+impl DetailCache {
+    pub(super) fn get_with(&mut self,id:u64,load:impl FnOnce(u64)->Option<(NowPlaying,String)>+Send+'static)->Option<(NowPlaying,String)>{
+        // 换歌时丢弃旧请求的接收端，迟到的结果不能套到新歌上。
+        if self.id!=Some(id){*self=Self{id:Some(id),worker:self.worker.take(),..Default::default()};}
+        if let Some(receiver)=&self.pending{
+            match receiver.try_recv(){
+                Ok(value)=>{
+                    self.pending=None;
+                    match value.filter(|(media,_)|media.song_id==Some(id)) {
+                        Some(value)=>self.value=Some(value),
+                        None=>{self.failures+=1;self.retry_at=DETAIL_RETRY.get(self.failures-1).map(|wait|Instant::now()+*wait);}
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected)=>{self.pending=None;}
+                Err(mpsc::TryRecvError::Empty)=>{}
+            }
+        }
+        let due=self.failures==0 || self.retry_at.is_some_and(|at|Instant::now()>=at);
+        if self.value.is_none() && self.pending.is_none() && due && self.worker.as_ref().is_none_or(|worker|worker.is_finished()){
+            let (sender,receiver)=mpsc::channel();
+            self.pending=Some(receiver);self.retry_at=None;
+            self.worker=crate::resources::COVER.spawn(move||{let _=sender.send(load(id));});
+            if self.worker.is_none(){self.pending=None;}
+        }
+        self.value.clone()
+    }
+}
+
+fn fetch_detail(id:u64)->Option<(NowPlaying,String)>{
+    let url=format!("https://music.163.com/api/song/detail/?ids=%5B{id}%5D");
+    let response=ureq::AgentBuilder::new().timeout(Duration::from_secs(5)).redirects(0).build().get(&url)
+        .set("User-Agent",concat!("Daozai/",env!("CARGO_PKG_VERSION")," (Windows)"))
+        .set("Referer","https://music.163.com").set("Accept","application/json").call().ok()?;
+    let limit=256*1024;let mut bytes=Vec::new();
+    response.into_reader().take(limit+1).read_to_end(&mut bytes).ok()?;
+    if bytes.len()>limit as usize{crate::resources::REJECTED_DATA.fetch_add(1,std::sync::atomic::Ordering::Relaxed);return None;}
+    detail_from(&serde_json::from_slice(&bytes).ok()?,id)
+}
+
+/// `{"code":200,"songs":[{…}]}`：歌曲字段与本地队列一致，只接受 ID 完全相同的那一首。
+fn detail_from(value:&serde_json::Value,id:u64)->Option<(NowPlaying,String)>{
+    if value.get("code").and_then(|v|v.as_i64())!=Some(200){return None;}
+    value.get("songs")?.as_array()?.iter().filter_map(track).find(|(media,_)|media.song_id==Some(id))
+}
+
+#[test]
+fn detail_response_fills_metadata_only_for_the_same_song(){
+    let body=serde_json::json!({"code":200,"songs":[{"id":1316574753u64,"name":"等你等到我心痛","artists":[{"name":"张学友"}],
+        "album":{"name":"张学友4合1珍藏集","picUrl":"https://p2.music.126.net/a8p2P1JofrH7C23LLtF_Yw==/109951169235647752.jpg"},"duration":253533}]});
+    let (media,cover)=detail_from(&body,1316574753).unwrap();
+    assert_eq!((media.title.as_str(),media.artist.as_str(),media.album.as_str()),("等你等到我心痛","张学友","张学友4合1珍藏集"));
+    assert!((media.duration-253.533).abs()<1e-6);assert!(cover.ends_with("?param=256y256"),"封面按缩略图尺寸请求");
+    assert!(detail_from(&body,1).is_none(),"返回的不是这首歌时不能套用");
+    assert!(detail_from(&serde_json::json!({"code":-460,"songs":[]}),1316574753).is_none());
+}
+
+#[test]
+fn detail_lookup_runs_in_background_retries_then_stops(){
+    use std::sync::{Arc as A,atomic::{AtomicUsize,Ordering}};
+    let calls=A::new(AtomicUsize::new(0));
+    let mut cache=DetailCache::default();
+    let wait=|cache:&mut DetailCache|{if let Some(worker)=cache.worker.take(){worker.join().unwrap();}};
+    for round in 0..3 {
+        let c=calls.clone();
+        assert!(cache.get_with(7,move|_|{c.fetch_add(1,Ordering::SeqCst);None}).is_none());
+        wait(&mut cache);
+        let c=calls.clone();cache.get_with(7,move|_|{c.fetch_add(1,Ordering::SeqCst);None});
+        assert_eq!(calls.load(Ordering::SeqCst),round+1,"未到重试时间不重复请求");
+        if round<2 {cache.retry_at=Some(Instant::now());}
+    }
+    wait(&mut cache);cache.get_with(7,|_|panic!("三次失败后这首歌不再请求"));
+    let found=(NowPlaying{title:"新歌".into(),song_id:Some(8),playback_type:MediaKind::Music,..Default::default()},String::new());
+    let value=found.clone();cache.get_with(8,move|_|Some(value));wait(&mut cache);
+    assert_eq!(cache.get_with(8,|_|panic!("已有结果不再请求")).unwrap().0.title,"新歌","换歌后重新查询");
+    let wrong=(NowPlaying{title:"别的歌".into(),song_id:Some(10),..Default::default()},String::new());
+    cache.get_with(9,move|_|Some(wrong));wait(&mut cache);
+    assert!(cache.get_with(9,|_|None).is_none(),"返回其他歌曲 ID 时不套用");
+}
+
 #[test]
 fn resource_cache_recreation_cannot_bypass_download_limit(){
     use std::sync::{Condvar,Mutex,atomic::{AtomicUsize,Ordering}};
@@ -211,6 +299,8 @@ pub(super) struct Reader {
     pid:u32,offset:u64,prefix:Vec<u8>,carry:Vec<u8>,skip_line:bool,
     playback:Playback,lookup:(Option<u64>,u64),cover:CoverCache,
     queue_print:Vec<Option<(std::time::SystemTime,u64)>>,
+    /// 本地队列确认查不到歌名的歌曲 ID：只对它们在线补全。
+    queue_missed:Option<u64>,detail:DetailCache,
 }
 impl Reader {
     pub(super) fn pending(&self)->bool {
@@ -257,12 +347,19 @@ impl Reader {
             // 否则大歌单下每 5 秒都要解析几十 MB。只有读取失败（被占用、写入中途）才清空指纹，稍后重试。
             if self.lookup.0!=id || self.queue_print!=print {
                 match queue_lookup(root,id?) {
-                    QueueLookup::Found(metadata)=>{self.playback.metadata(metadata);self.queue_print=print;}
-                    QueueLookup::Absent=>self.queue_print=print,
-                    QueueLookup::Unreadable=>self.queue_print.clear(),
+                    QueueLookup::Found(metadata)=>{self.playback.metadata(metadata);self.queue_print=print;self.queue_missed=None;}
+                    QueueLookup::Absent=>{self.queue_print=print;self.queue_missed=id;}
+                    QueueLookup::Unreadable=>{self.queue_print.clear();self.queue_missed=id;}
                 }
             }
             self.lookup=(id,now);
+        }
+        // 本地查不到歌名（漫游等模式）时按 ID 在线补全；每次轮询都取一下结果，查到后下一次采样就能显示。
+        if let Some(id)=id.filter(|id|self.queue_missed==Some(*id)) {
+            if !self.playback.media.is_music() || self.playback.media.artist.is_empty() || self.playback.media.duration<=0.0 || self.playback.artwork_url.is_empty() {
+                let load:fn(u64)->Option<(NowPlaying,String)>=if cfg!(test){|_|None}else{fetch_detail};
+                if let Some(metadata)=self.detail.get_with(id,load){self.playback.metadata(metadata);}
+            }
         }
         self.playback.snapshot(now)
     }
@@ -585,6 +682,14 @@ mod tests{
         let mut found=incomplete_track(123);found["duration"]=180000.into();
         files.queue("playingList","list",serde_json::json!([other,found]));
         assert_eq!(reader.read(&files.path,Some(9),8000).unwrap().duration,180.0,"队列变化后照常重新查找");
+        // 漫游等模式：日志只有歌曲 ID，队列里也没有，界面应显示在线补全的歌名。
+        let next=format!("\"native播放资源load完成，开始播放\",{{\"songId\":\"789\"}}");
+        { use std::io::Write; std::fs::OpenOptions::new().append(true).open(&files.path).unwrap().write_all(&encode(&event(9,3000,&next))).unwrap(); }
+        assert!(reader.read(&files.path,Some(9),9000).is_none(),"只有 ID、没有歌名时不显示");
+        assert_eq!(reader.queue_missed,Some(789),"本地确认查不到才在线补全");
+        reader.detail=DetailCache{id:Some(789),value:Some((NowPlaying{title:"漫游歌曲".into(),artist:"歌手".into(),song_id:Some(789),duration:200.0,playback_type:MediaKind::Music,source:"cloudmusic.exe".into(),..Default::default()},String::new())),..Default::default()};
+        let media=reader.read(&files.path,Some(9),9500).unwrap();
+        assert_eq!((media.title.as_str(),media.song_id),("漫游歌曲",Some(789)),"在线补全的歌名套到当前歌曲");
         std::fs::write(files.root.join("webdata/file/playingList"),b"{\"list\":[{\"track\":").unwrap();
         assert!(matches!(queue_lookup(&files.root,123),QueueLookup::Unreadable),"写入中途截断视为暂时读不了，需要重试");
     }
