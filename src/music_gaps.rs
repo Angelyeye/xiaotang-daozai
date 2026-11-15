@@ -41,6 +41,9 @@ impl Tracker {
         self.done=true;
         let gaps=gaps(media);
         if gaps.is_empty(){return None;}
+        if !media.is_music(){
+            return Some(format!("{} · 来源 {} · 缺 {}",media.source,origin(media),gaps.join("、")));
+        }
         let id=media.song_id.map(|id|format!(" ID={id}")).unwrap_or_default();
         Some(format!("{} · {} - {}{id} · 来源 {} · 缺 {}",media.source,media.title,
             if media.artist.is_empty(){"（无歌手）"}else{&media.artist},origin(media),gaps.join("、")))
@@ -65,6 +68,17 @@ mod tests {
         NowPlaying{title:title.into(),artist:artist.into(),source:"qqmusic".into(),playing:true,duration:200.0,
             playback_type:MediaKind::Music,sampled_at:Some(Instant::now()),
             artwork:Some(std::sync::Arc::new(eframe::egui::ColorImage::new([1,1],eframe::egui::Color32::RED))),..Default::default()}
+    }
+    #[test]
+    fn video_gap_report_omits_the_title_and_creator(){
+        let mut media=song("会议回放","演示账号");
+        media.playback_type=MediaKind::Video;
+        let mut tracker=Tracker::default();
+        let start=Instant::now();
+        tracker.observe(&media,start);
+        let line=tracker.observe(&media,start+SETTLE).unwrap();
+        assert!(line.contains("类型为视频"));
+        assert!(!line.contains(&media.title) && !line.contains(&media.artist));
     }
     #[test]
     fn complete_songs_are_not_recorded_and_gaps_are_named(){

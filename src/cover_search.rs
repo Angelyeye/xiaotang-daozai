@@ -38,10 +38,11 @@ impl CoverSearch {
         if self.image.is_none() && self.pending.is_none() && waited && due && self.worker.as_ref().is_none_or(|w|w.is_finished()) {
             let (sender,receiver)=mpsc::channel();
             let (title,artist,duration)=(media.title.clone(),media.artist.clone(),media.duration);
-            self.attempts+=1;self.retry_at=None;self.pending=Some(receiver);
             // 与其他封面下载共用并发上限，网络卡住时不会越积越多。
             self.worker=crate::resources::COVER.spawn(move||{let _=sender.send(load(title,artist,duration));});
-            if self.worker.is_none(){self.pending=None;}
+            if self.worker.is_some(){
+                self.attempts+=1;self.retry_at=None;self.pending=Some(receiver);
+            }
         }
         self.image.clone()
     }
@@ -98,6 +99,21 @@ mod tests {
         assert!(pick(&songs(),"遥远的她","别的歌手",253.0).is_none());
         assert_eq!(pick(&songs(),"遥远的她","",240.5).as_deref(),Some("https://p2.music.126.net/cover.jpg"),"没有歌手时靠时长确认");
         assert!(pick(&songs(),"遥远的她","",0.0).is_none(),"没有歌手也没有时长时不猜");
+    }
+    #[test]
+    fn cover_waits_for_a_free_worker_without_spending_an_attempt(){
+        let media=NowPlaying{title:"晚风".into(),artist:"示例歌手".into(),playback_type:MediaKind::Music,..Default::default()};
+        let now=Instant::now();
+        let mut cache=CoverSearch::default();
+        cache.fill_with(&media,now,|_,_,_|None);
+        let busy=[crate::resources::COVER.acquire().unwrap(),crate::resources::COVER.acquire().unwrap()];
+        cache.fill_with(&media,now+WAIT,|_,_,_|panic!("工作线程已占满"));
+        drop(busy);
+        let image=Arc::new(ColorImage::new([1,1],eframe::egui::Color32::RED));
+        let expected=image.clone();
+        cache.fill_with(&media,now+WAIT+RETRY,move|_,_,_|Some(image));
+        cache.worker.take().expect("并发空位释放后仍应补封面").join().unwrap();
+        assert!(Arc::ptr_eq(&cache.fill_with(&media,now+WAIT+RETRY,|_,_,_|None).unwrap(),&expected));
     }
     #[test]
     fn search_waits_then_runs_once_in_background_and_follows_the_song(){

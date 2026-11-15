@@ -172,9 +172,8 @@ impl DetailCache {
         let due=self.failures==0 || self.retry_at.is_some_and(|at|Instant::now()>=at);
         if self.value.is_none() && self.pending.is_none() && due && self.worker.as_ref().is_none_or(|worker|worker.is_finished()){
             let (sender,receiver)=mpsc::channel();
-            self.pending=Some(receiver);self.retry_at=None;
             self.worker=crate::resources::COVER.spawn(move||{let _=sender.send(load(id));});
-            if self.worker.is_none(){self.pending=None;}
+            if self.worker.is_some(){self.pending=Some(receiver);self.retry_at=None;}
         }
         self.value.clone()
     }
@@ -221,6 +220,11 @@ fn detail_lookup_runs_in_background_retries_then_stops(){
         let c=calls.clone();cache.get_with(7,move|_|{c.fetch_add(1,Ordering::SeqCst);None});
         assert_eq!(calls.load(Ordering::SeqCst),round+1,"未到重试时间不重复请求");
         if round<2 {cache.retry_at=Some(Instant::now());}
+        if round==0 {
+            let busy=[crate::resources::COVER.acquire().unwrap(),crate::resources::COVER.acquire().unwrap()];
+            cache.get_with(7,|_|panic!("已有两个后台请求"));
+            drop(busy);
+        }
     }
     wait(&mut cache);cache.get_with(7,|_|panic!("三次失败后这首歌不再请求"));
     let found=(NowPlaying{title:"新歌".into(),song_id:Some(8),playback_type:MediaKind::Music,..Default::default()},String::new());

@@ -1,6 +1,7 @@
 ﻿param(
     [string]$OutputDirectory = [Environment]::GetFolderPath('Desktop'),
-    [string]$DataDirectory = $(if ($env:DAOZAI_DATA_DIR) { $env:DAOZAI_DATA_DIR } else { Join-Path $env:APPDATA 'Daozai' })
+    [string]$DataDirectory = $(if ($env:DAOZAI_DATA_DIR) { $env:DAOZAI_DATA_DIR } else { Join-Path $env:APPDATA 'Daozai' }),
+    [switch]$RevealArchive
 )
 $ErrorActionPreference = 'Stop'
 $collectionRoot = Join-Path ([IO.Path]::GetTempPath()) ('daozai-diagnostics-' + [guid]::NewGuid().ToString('N'))
@@ -9,7 +10,11 @@ $missing = New-Object 'System.Collections.Generic.List[string]'
 function Save-Text([string]$Name, [string]$Value) {
     foreach ($key in @('LOCALAPPDATA', 'APPDATA', 'USERPROFILE')) {
         $privatePath = [Environment]::GetEnvironmentVariable($key)
-        if ($privatePath) { $Value = $Value.Replace($privatePath, ('%' + $key + '%')) }
+        if ($privatePath) {
+            $placeholder = '%' + $key + '%'
+            $Value = $Value -replace [regex]::Escape($privatePath.Replace('\','\\')), $placeholder
+            $Value = $Value -replace [regex]::Escape($privatePath), $placeholder
+        }
     }
     [IO.File]::WriteAllText((Join-Path $collectionRoot $Name), $Value, $utf8)
 }
@@ -20,7 +25,7 @@ try {
         'weather-network.log', 'weather-network.previous.log',
         'messenger-events.log', 'messenger-events.previous.log', 'wechat-events.log', 'wechat-tray.log',
         'calendar.log', 'calendar.previous.log', 'lyrics.log', 'lyrics.previous.log',
-        'music-gaps.log', 'music-gaps.previous.log', 'auto-restart.log')
+        'music-gaps.log', 'music-gaps.previous.log', 'frames.log', 'frames.previous.log', 'auto-restart.log')
     foreach ($name in $logs + @('glass-diagnostics.txt')) {
         $source = if ($name -eq 'glass-diagnostics.txt') { Join-Path $DataDirectory $name } else { Join-Path (Join-Path $DataDirectory 'diagnostics') $name }
         if (!(Test-Path -LiteralPath $source -PathType Leaf)) { $missing.Add($name); continue }
@@ -154,7 +159,11 @@ public static class DaozaiDiagnosticWindows {
     Write-Output ('诊断包已保存：' + $archive)
     Write-Output '请将诊断包发给开发者，并说明异常出现时间、重启岛仔能否恢复、是否发生在睡眠唤醒后。'
     Write-Output '音乐没有歌名、封面或歌词时，请在歌曲播放中运行诊断，并说明使用的播放模式（歌单、电台、FM、漫游等）。'
-    Write-Output '仅收集岛仔诊断日志、显示与功能开关、系统与显卡信息、消息客户端窗口类型和播放器状态；不读聊天内容和窗口标题，不会自动上传。'
+    Write-Output '诊断包含岛仔日志、功能开关、系统与显卡信息、消息窗口类型和播放器状态。音乐日志可能含有歌名和歌手。诊断包由你决定是否分享。'
+    if ($RevealArchive) {
+        Read-Host '按回车键查看诊断包' | Out-Null
+        Start-Process -FilePath (Join-Path $env:WINDIR 'explorer.exe') -ArgumentList ('/select,"' + $archive + '"')
+    }
 } finally {
     Get-ChildItem -LiteralPath $collectionRoot -File | ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force }
     Remove-Item -LiteralPath $collectionRoot -Force

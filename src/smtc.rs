@@ -31,9 +31,11 @@ pub(crate) mod player_process;
 #[path="music_log.rs"]
 mod music_log;
 
+#[cfg(windows)]
 #[path="music_gaps.rs"]
 mod music_gaps;
 
+#[cfg(windows)]
 #[path="cover_search.rs"]
 mod cover_search;
 
@@ -804,7 +806,9 @@ pub fn spawn_poller(state: Shared,ctx:eframe::egui::Context)->Poller {
         let mut bodian=bodian::Reader::default();
         #[cfg(windows)]
         let mut kuwo=kuwo::Reader::default();
+        #[cfg(windows)]
         let mut cover_search=cover_search::CoverSearch::default();
+        #[cfg(windows)]
         let mut gaps=music_gaps::Tracker::default();
         loop {
             if stopped.load(std::sync::atomic::Ordering::Acquire) || Arc::strong_count(&state)==1{break;}
@@ -830,8 +834,10 @@ pub fn spawn_poller(state: Shared,ctx:eframe::egui::Context)->Poller {
             #[cfg(windows)]
             netease.fill_artwork(&mut np);
             // 播放器没给封面（缺系统缩略图、电台 / FM 等模式）时按歌名在线找一张。
+            #[cfg(windows)]
             if np.artwork.is_none(){np.artwork=cover_search.fill(&np,std::time::Instant::now());}
             playback_clock.update(&mut np);
+            #[cfg(windows)]
             if let Some(line)=gaps.observe(&np,std::time::Instant::now()){music_gaps::record(&line,&np.source);}
             let idle=np.title.is_empty();
             if idle {
@@ -862,6 +868,7 @@ mod tests {
             assert!(media.is_music(),"{source} 应按音乐处理");
         }
         for source in ["Tencent.QQ","QQMusic.exe.bak","chrome.exe"] {assert!(!is_qqmusic(source),"{source}");}
+        #[cfg(windows)]
         assert_eq!(music_log::player_exe("Tencent.QQMusic"),Some("QQMusic.exe"));
     }
     #[test]
