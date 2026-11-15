@@ -131,10 +131,46 @@ fn open(unread:Unread,paths:&[String],_:bool)->Result<(),OpenError>{unsafe{
     if !matches(window,paths){wake_step("提醒窗口所属程序不在已知安装路径中");return Err(OpenError::Unavailable);}
     // 不执行协议、托盘回调或鼠标键盘模拟，只恢复该消息保存的主窗口。
     wake_step(format!("切前台 {}",describe_window(window)));
-    if IsIconic(window).as_bool(){let _=ShowWindowAsync(window,SW_RESTORE);}
-    else if !IsWindowVisible(window).as_bool(){let _=ShowWindowAsync(window,SW_SHOW);}
+    match wake_route(unread.source,IsWindowVisible(window).as_bool(),IsIconic(window).as_bool()) {
+        WakeRoute::Restore=>{let _=ShowWindowAsync(window,SW_RESTORE);}
+        WakeRoute::Show=>{let _=ShowWindowAsync(window,SW_SHOW);}
+        WakeRoute::Relaunch=>return relaunch(window,unread.pid,paths),
+        WakeRoute::Focus=>{}
+    }
     if SetForegroundWindow(window).as_bool(){wake_step("系统已接受");Ok(())}else{wake_step("系统拒绝切前台");Err(OpenError::Unavailable)}
 }}
+
+#[derive(Debug,PartialEq,Eq)]
+enum WakeRoute {Focus,Restore,Show,Relaunch}
+/// 怎样把主窗口带到前台。飞书关到托盘后窗口被隐藏，若由岛仔直接 `ShowWindow`，飞书不会恢复渲染，
+/// 页面停在加载骨架、点击无响应（#181，本机飞书 8.6 复现）；改为再启动一次飞书主程序，由飞书自己显示原窗口。
+/// 最小化的窗口照常还原（实测正常）；其他客户端未验证，保持原做法。
+fn wake_route(source:Messenger,visible:bool,iconic:bool)->WakeRoute {
+    if iconic {WakeRoute::Restore}
+    else if visible {WakeRoute::Focus}
+    else if source==Messenger::Feishu {WakeRoute::Relaunch}
+    else {WakeRoute::Show}
+}
+
+/// 启动提醒窗口所属进程自己的程序（单实例：不会多开，飞书把已有主窗口显示出来），再等窗口出现。
+unsafe fn relaunch(window:HWND,pid:u32,paths:&[String])->Result<(),OpenError>{
+    let Some(path)=crate::smtc::player_process::image_path(pid) else{wake_step("无法读取客户端程序路径");return Err(OpenError::Unavailable);};
+    // 只启动已核实属于该客户端（安装路径或文件名加发行商签名）的程序。
+    if !path_allowed(&normalized(&path),paths) {wake_step("客户端程序不在已知安装路径中");return Err(OpenError::Unavailable);}
+    let directory=std::path::Path::new(&path).parent().map(std::path::Path::to_path_buf);
+    let mut command=std::process::Command::new(&path);
+    if let Some(directory)=directory {command.current_dir(directory);}
+    wake_step("窗口在托盘中，由客户端自己显示主窗口");
+    if command.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().is_err(){
+        wake_step("启动客户端程序失败");return Err(OpenError::Unavailable);
+    }
+    let until=std::time::Instant::now()+std::time::Duration::from_secs(3);
+    while std::time::Instant::now()<until {
+        if IsWindowVisible(window).as_bool(){let _=SetForegroundWindow(window);wake_step("客户端已显示主窗口");return Ok(());}
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    wake_step("客户端 3 秒内没有显示主窗口");Err(OpenError::Unavailable)
+}
 
 #[cfg(test)]
 mod tests{
@@ -152,6 +188,29 @@ mod tests{
             assert_eq!(select_target(client,11,&[a,Target{unread:Unread{window:44,..a.unread},..a}]),Unread::of(client),"同进程多窗口不能当作唯一账号");
         }
     }
+    #[test]
+    fn feishu_in_tray_is_shown_by_feishu_itself(){
+        assert_eq!(wake_route(Messenger::Feishu,false,false),WakeRoute::Relaunch,"关到托盘的飞书不能由岛仔直接显示（#181 卡死）");
+        assert_eq!(wake_route(Messenger::Feishu,true,true),WakeRoute::Restore,"最小化的飞书照常还原");
+        assert_eq!(wake_route(Messenger::Feishu,true,false),WakeRoute::Focus);
+        for client in [Messenger::DingTalk,Messenger::WeCom] {assert_eq!(wake_route(client,false,false),WakeRoute::Show,"其他客户端未验证，保持原做法");}
+    }
+    /// 本机实测：先把飞书关到托盘，再运行 `cargo test live_feishu -- --ignored`，走岛仔点提醒时的同一条唤起路径。
+    #[test]
+    #[ignore="需要本机飞书已登录并关到托盘"]
+    fn live_feishu_tray_window_is_shown_by_feishu(){unsafe{
+        let paths=client_paths(Messenger::Feishu);
+        let accounts=candidates(Messenger::Feishu,&paths).expect("应找到飞书主窗口");
+        let [target]=accounts.as_slice() else{panic!("应只有一个飞书主窗口：{}",accounts.len())};
+        let window=HWND(target.unread.window as *mut _);
+        assert!(!IsWindowVisible(window).as_bool(),"请先把飞书关到托盘");
+        crate::messenger::windows::take_wake_steps();
+        let result=open(target.unread,&paths,true);
+        let steps=crate::messenger::windows::take_wake_steps();
+        eprintln!("{steps:?}");
+        assert_eq!(result,Ok(()));assert!(IsWindowVisible(window).as_bool());
+        assert!(steps.iter().any(|s|s.contains("由客户端自己显示")));
+    }}
     #[test]
     fn main_window_rules_exclude_login_popups_and_cross_client_windows(){
         let frame=WS_OVERLAPPEDWINDOW.0;
