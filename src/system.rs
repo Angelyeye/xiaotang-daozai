@@ -221,7 +221,7 @@ struct Foreground {
 
 /// 前台从全屏窗口切到别的窗口时，是否仍按原来的全屏处理（岛仔保持隐藏）。
 ///
-/// 3ds Max、Photoshop 这类软件全屏（或最大化后盖满整块屏幕）时，插件面板、浮动工具条、
+/// 3ds Max、Photoshop 这类软件全屏时，插件面板、浮动工具条、
 /// 属性对话框都是同一个程序的附属窗口；每点一下前台就在它们和主窗口之间来回切，
 /// 过去岛仔会跟着「出现 → 消失」闪一次。只要原来的全屏窗口还盖着屏幕，
 /// 而新的前台是它的附属窗口（被它拥有，或同一程序里不单独占任务栏的窗口），就继续隐藏。
@@ -249,6 +249,11 @@ unsafe fn foreground_info(hwnd: HWND) -> Foreground {
 /// 窗口盖满它所在的整块屏幕时返回该屏幕范围。
 unsafe fn covering_monitor(hwnd: HWND) -> Option<crate::display_layout::Bounds> {
     if !IsWindow(hwnd).as_bool() || !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
+        return None;
+    }
+    // 任务栏自动隐藏时，普通最大化窗口的外框也可能覆盖整屏。
+    // Chromium 的 F11 全屏会去掉标题栏，但可能保留最大化标志。
+    if IsZoomed(hwnd).as_bool() && GetWindowLongPtrW(hwnd, GWL_STYLE) as u32 & WS_CAPTION.0 == WS_CAPTION.0 {
         return None;
     }
     let mut r = RECT::default();
@@ -313,6 +318,30 @@ mod fullscreen_follow_tests {
     use super::*;
 
     const MAX: Foreground = Foreground { hwnd: 100, pid: 7, root_owner: 100, app_window: true };
+
+    #[test]
+    fn maximized_browser_and_borderless_fullscreen_at_the_same_bounds_are_distinct() {
+        unsafe {
+            let hwnd = CreateWindowExW(WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, windows::core::w!("STATIC"),
+                windows::core::w!(""), WS_OVERLAPPEDWINDOW | WS_MAXIMIZE, 0, 0, 320, 240, None, None, None, None).unwrap();
+            let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+            assert!(GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut info).as_bool());
+            let r = info.rcMonitor;
+            let cover = || SetWindowPos(hwnd, HWND_BOTTOM, r.left, r.top, r.right-r.left, r.bottom-r.top,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED).unwrap();
+            cover();
+            assert!(IsZoomed(hwnd).as_bool());
+            let maximized = covering_monitor(hwnd);
+            // Chromium 进入 F11 时移除标题栏和可调整大小的边框，仍可能保留最大化标志。
+            let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+            SetWindowLongPtrW(hwnd, GWL_STYLE, style & !((WS_CAPTION | WS_THICKFRAME).0 as isize));
+            cover();
+            let fullscreen = covering_monitor(hwnd);
+            DestroyWindow(hwnd).unwrap();
+            assert!(fullscreen.is_some(), "无边框全屏仍应隐藏岛仔");
+            assert!(maximized.is_none(), "普通最大化即使盖满屏幕也应显示岛仔");
+        }
+    }
 
     #[test]
     fn plugin_panels_and_dialogs_of_the_fullscreen_app_keep_the_island_hidden() {
