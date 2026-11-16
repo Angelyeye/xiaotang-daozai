@@ -5971,6 +5971,39 @@ fn page_order_drag_applies_on_release_and_saves() {
 }
 
 #[test]
+fn general_settings_controls_fit_when_resizing_to_minimum_width() {
+    let _guard=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    let mut h=H::new();
+    h.app.open_settings();
+    h.app.settings.skin=crate::model::Skin::GlassDark;
+    h.ctx.set_embed_viewports(false);
+    for (width,scale) in [(800.0,1.0),(600.0,2.0),(690.0,1.25)] {
+        let output=std::sync::Arc::new(Mutex::new(None));
+        let capture=output.clone();
+        egui::Context::set_immediate_viewport_renderer(move|ctx,mut viewport|{
+            let id=viewport.ids.this;
+            let input=egui::RawInput{viewport_id:id,screen_rect:Some(Rect::from_min_size(Pos2::ZERO,egui::vec2(width,1800.0))),
+                viewports:std::iter::once((id,egui::ViewportInfo{native_pixels_per_point:Some(scale),..Default::default()})).collect(),..Default::default()};
+            *capture.lock().unwrap()=Some(ctx.run(input,|ctx|(viewport.viewport_ui_cb)(ctx)));
+        });
+        for _ in 0..3 {let _=h.ctx.run(Default::default(),|ctx|h.app.settings_ui(ctx,false));}
+        let frame=output.lock().unwrap().take().unwrap();
+        for label in ["经典","奶油","毛玻璃·浅","毛玻璃·深","悬浮云","恢复默认","恢复居中"] {
+            let shape=frame.shapes.iter().find(|s|matches!(&s.shape,egui::Shape::Text(t) if t.galley.text()==label))
+                .unwrap_or_else(||panic!("窗口宽 {width} 时缺少控件 {label}"));
+            assert!(shape.clip_rect.contains_rect(shape.shape.visual_bounding_rect()),"窗口宽 {width} 时 {label} 被裁切");
+        }
+        for shape in &frame.shapes {
+            if let egui::Shape::Rect(r)=&shape.shape {
+                if r.rect.size()==egui::vec2(34.0,20.0) {
+                    assert!(r.rect.right()<=shape.clip_rect.right(),"窗口宽 {width} 时开关右侧被裁切");
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn settings_theme_follows_system_and_preserves_island_style() {
     use crate::settings_theme::SettingsTheme;
     let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());

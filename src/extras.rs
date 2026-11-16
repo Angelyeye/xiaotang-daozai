@@ -1102,7 +1102,7 @@ pub(crate) fn settings_segmented<T:PartialEq+Copy>(ui:&mut egui::Ui,value:&mut T
     let mut changed=false;
     egui::Frame::new().fill(settings_color(ctx,Color32::from_rgb(28,28,30),Color32::from_rgb(230,233,238)))
         .corner_radius(8.0).inner_margin(3).show(ui,|ui|{
-            ui.horizontal(|ui|{
+            ui.horizontal_wrapped(|ui|{
                 ui.spacing_mut().item_spacing.x=2.0;
                 for (option,label) in options {
                     let selected=*value==*option;
@@ -1504,8 +1504,9 @@ impl App {
                             }
                             ui.separator();
                             settings_control_row(ui,"大小",56.0,|ui|{
-                                ui.horizontal(|ui|{
-                                    ui.spacing_mut().slider_width=180.0;
+                                ui.horizontal_wrapped(|ui|{
+                                    // 给百分比和恢复按钮留出空间，宽窗口仍使用原来的轨道长度。
+                                    ui.spacing_mut().slider_width=(ui.available_width()-150.0).clamp(64.0,180.0);
                                     island_size_slider(ui,&mut self.settings.island_size);
                                     if ui.add_enabled(self.settings.island_size!=100,egui::Button::new("恢复默认")).clicked(){self.settings.island_size=100;}
                                 }).response
@@ -1537,12 +1538,13 @@ impl App {
                             ui.add_space(4.0);
                             let side=self.settings.dock.is_side();
                             settings_control_row(ui,if side{"上下位置"}else{"水平位置"},56.0,|ui|{
-                                ui.horizontal(|ui|{
+                                ui.horizontal_wrapped(|ui|{
                                     let limit=crate::model::ISLAND_OFFSET_MAX;
                                     let offset=&mut self.settings.island_offset;
                                     let (less,more,less_tip,more_tip)=if side{("↑","↓","向上微调","向下微调")}else{("←","→","向左微调","向右微调")};
                                     if ui.add_enabled(*offset>-limit,egui::Button::new(less).min_size(egui::vec2(26.0,22.0))).on_hover_text(less_tip).clicked(){*offset=(*offset-5).max(-limit);}
-                                    ui.spacing_mut().slider_width=150.0;
+                                    // 左侧微调按钮已占位，剩余宽度还要容纳右侧微调和恢复居中。
+                                    ui.spacing_mut().slider_width=(ui.available_size_before_wrap().x-134.0).clamp(64.0,150.0);
                                     ui.add(egui::Slider::new(&mut *offset,-limit..=limit).show_value(false));
                                     if ui.add_enabled(*offset<limit,egui::Button::new(more).min_size(egui::vec2(26.0,22.0))).on_hover_text(more_tip).clicked(){*offset=(*offset+5).min(limit);}
                                     if ui.add_enabled(*offset!=0,egui::Button::new("恢复居中")).clicked(){*offset=0;}
