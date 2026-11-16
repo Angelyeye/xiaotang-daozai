@@ -6488,6 +6488,23 @@ fn avoidance_picker_add_remove_and_save() {
     }
     click(&mut h,point(&out,"×"));assert!(h.app.settings.avoid_apps.is_empty());
     h.app.settings.save();assert!(crate::model::Settings::load().avoid_apps.is_empty());
+
+    h.app.settings.avoid_browsers=true;
+    h.app.settings.avoid_apps.push(("D:/one.exe".into(),"已登记".into()));
+    for (path,name,browser) in [("d:/ONE.exe","已登记",false),("D:/two.exe","工具二",false),
+        ("D:/three.exe","工具三",false),("D:/browser.exe","浏览器",true)] {
+        h.app.avoidance.entries.push(crate::avoidance::Candidate{path:path.into(),name:name.into(),title:"插件面板".into(),browser});
+    }
+    h.app.avoidance.open=true;
+    draw(&mut h,vec![]);
+    let out=draw(&mut h,vec![]);
+    click(&mut h,point(&out,"搜索应用或窗口标题"));
+    draw(&mut h,vec![egui::Event::Text("插件面板".into())]);
+    let out=draw(&mut h,vec![]);
+    click(&mut h,point(&out,"全部添加"));
+    assert!(!h.app.avoidance.open);
+    assert_eq!(h.app.settings.avoid_apps.iter().map(|(p,_)|p.as_str()).collect::<Vec<_>>(),["D:/one.exe","D:/two.exe","D:/three.exe"]);
+    h.app.settings.save();assert_eq!(crate::model::Settings::load().avoid_apps,h.app.settings.avoid_apps);
 }
 
 #[test]
@@ -6516,7 +6533,7 @@ fn avoidance_icon_area_stays_one_row_and_scrolls() {
     fn text(out:&egui::FullOutput,label:&str)->Rect {
         out.shapes.iter().find_map(|s|match &s.shape{egui::Shape::Text(t) if t.galley.text()==label=>Some(t.visual_bounding_rect()),_=>None}).unwrap()
     }
-    let footer="无需全屏或最大化；窗口移开或切换应用后恢复。";
+    let footer="自定义应用的任一窗口在前台时都会避让，包括副屏窗口。";
     h.app.settings.avoid_apps=vec![("D:/sample/A.exe".into(),"A应用".into())];
     draw(&mut h,vec![]);let one=draw(&mut h,vec![]);let baseline=text(&one,footer).top();
     let cross=text(&one,"×").center();

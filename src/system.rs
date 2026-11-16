@@ -381,17 +381,22 @@ pub fn browser_at_top(island:HWND,settings:&crate::model::Settings)->Option<bool
         GetWindowThreadProcessId(foreground,Some(&mut pid));
         // 设置、托盘和岛内输入沿用此前的避让状态，避免自身窗口引起反复切换。
         if pid==0 || pid==GetCurrentProcessId(){return None;}
-        let mut browser_rect=RECT::default();let mut island_rect=RECT::default();
-        if GetWindowRect(foreground,&mut browser_rect).is_err() || GetWindowRect(island,&mut island_rect).is_err(){return None;}
-        if !browser_overlaps_island(browser_rect,island_rect,settings.dock){return Some(false);}
-        let Ok(process)=OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,false,pid) else{return Some(false)};
-        let mut path=[0u16;1024];let mut length=path.len() as u32;
-        let result=QueryFullProcessImageNameW(process,PROCESS_NAME_WIN32,PWSTR(path.as_mut_ptr()),&mut length);
-        let _=CloseHandle(process);
-        if result.is_err(){return Some(false);}
-        let path=String::from_utf16_lossy(&path[..length as usize]);
-        Some(avoidance_matches(&path,settings))
+        avoidance_for_window(foreground,island,pid,settings)
     }
+}
+
+unsafe fn avoidance_for_window(foreground:HWND,island:HWND,pid:u32,settings:&crate::model::Settings)->Option<bool> {
+    let mut browser_rect=RECT::default();let mut island_rect=RECT::default();
+    if GetWindowRect(foreground,&mut browser_rect).is_err() || GetWindowRect(island,&mut island_rect).is_err(){return None;}
+    let overlaps=browser_overlaps_island(browser_rect,island_rect,settings.dock);
+    if !overlaps && settings.avoid_apps.is_empty(){return Some(false);}
+    let Ok(process)=OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,false,pid) else{return Some(false)};
+    let mut path=[0u16;1024];let mut length=path.len() as u32;
+    let result=QueryFullProcessImageNameW(process,PROCESS_NAME_WIN32,PWSTR(path.as_mut_ptr()),&mut length);
+    let _=CloseHandle(process);
+    if result.is_err(){return Some(false);}
+    let path=String::from_utf16_lossy(&path[..length as usize]);
+    Some(avoidance_matches(&path,settings,overlaps))
 }
 
 pub enum Incoming {
@@ -832,9 +837,9 @@ mod tests {
     }
 }
 
-fn avoidance_matches(path:&str,settings:&crate::model::Settings)->bool {
+fn avoidance_matches(path:&str,settings:&crate::model::Settings,overlaps:bool)->bool {
     settings.browser_minimal && (crate::avoidance::contains_app(&settings.avoid_apps,path)
-        || settings.avoid_browsers && std::path::Path::new(path).file_name().and_then(|name|name.to_str()).is_some_and(is_browser_process))
+        || overlaps && settings.avoid_browsers && std::path::Path::new(path).file_name().and_then(|name|name.to_str()).is_some_and(is_browser_process))
 }
 
 pub(crate) fn avoidance_windows()->std::result::Result<Vec<crate::avoidance::Candidate>,String> {
@@ -888,19 +893,45 @@ fn executable_description(path:&str)->Option<String> {
 mod avoidance_tests {
     use super::*;
     #[test]
+    fn registered_app_keeps_avoidance_when_its_plugin_panel_takes_focus() {
+        unsafe {
+            let create=|x,y,width,height,owner| CreateWindowExW(WS_EX_TOOLWINDOW,windows::core::w!("STATIC"),
+                windows::core::w!(""),WS_POPUP,x,y,width,height,owner,None,None,None).unwrap();
+            let island=create(0,0,960,100,None);
+            let host=create(0,0,1920,1080,None);
+            let panel=create(600,300,300,200,Some(&host));
+            let path=std::env::current_exe().unwrap();
+            let mut settings=crate::model::Settings::default();
+            settings.browser_minimal=true;
+            settings.avoid_apps.push((path.to_string_lossy().into_owned(),"测试宿主".into()));
+            let poll=|window,settings:&crate::model::Settings| avoidance_for_window(window,island,GetCurrentProcessId(),settings);
+            let results=[poll(host,&settings),poll(panel,&settings),poll(host,&settings)];
+            settings.browser_minimal=false;
+            let disabled=poll(panel,&settings);
+            settings.browser_minimal=true;
+            settings.avoid_apps.clear();
+            let removed=poll(panel,&settings);
+            DestroyWindow(host).unwrap();
+            DestroyWindow(island).unwrap();
+            assert_eq!(results,[Some(true);3],"焦点从宿主切到中央插件浮窗再切回时应持续避让");
+            assert_eq!((disabled,removed),(Some(false),Some(false)));
+        }
+    }
+    #[test]
     fn avoidance_respects_master_browser_switch_and_custom_app_identity() {
         let mut settings=crate::model::Settings::default();
         settings.avoid_apps=vec![(r"D:\Apps\Editor.exe".into(),"编辑器".into())];
-        assert!(!avoidance_matches(r"D:\Apps\Editor.exe",&settings));
+        assert!(!avoidance_matches(r"D:\Apps\Editor.exe",&settings,true));
         settings.browser_minimal=true;
-        assert!(avoidance_matches(r"D:\Quark\quark.exe",&settings));
-        assert!(avoidance_matches(r"d:\apps\EDITOR.EXE",&settings));
-        assert!(!avoidance_matches(r"C:\Other\Editor.exe",&settings));
+        assert!(avoidance_matches(r"D:\Quark\quark.exe",&settings,true));
+        assert!(avoidance_matches(r"d:\apps\EDITOR.EXE",&settings,true));
+        assert!(!avoidance_matches(r"C:\Other\Editor.exe",&settings,true));
+        assert!(!avoidance_matches(r"D:\Quark\quark.exe",&settings,false));
         settings.avoid_browsers=false;
-        assert!(!avoidance_matches(r"D:\Quark\quark.exe",&settings));
-        assert!(avoidance_matches(r"D:\Apps\Editor.exe",&settings));
+        assert!(!avoidance_matches(r"D:\Quark\quark.exe",&settings,true));
+        assert!(avoidance_matches(r"D:\Apps\Editor.exe",&settings,true));
         settings.avoid_apps.clear();
-        assert!(!avoidance_matches(r"D:\Apps\Editor.exe",&settings));
+        assert!(!avoidance_matches(r"D:\Apps\Editor.exe",&settings,true));
     }
     #[test]
     fn avoidance_window_list_excludes_this_process_and_deduplicates_apps() {

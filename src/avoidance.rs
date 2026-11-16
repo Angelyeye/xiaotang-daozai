@@ -41,10 +41,10 @@ impl Picker {
     pub(crate) fn settings(&mut self,ui:&mut egui::Ui,settings:&mut Settings) {
         settings_label(ui,"自动避让");
         settings_card(ui,|ui|{
-            setting_row(ui,"自动避让","指定应用在前台并遮住岛的位置时，收成细线",&mut settings.browser_minimal);
+            setting_row(ui,"自动避让","使用下列应用时，岛会收成细线",&mut settings.browser_minimal);
             ui.add_enabled_ui(settings.browser_minimal,|ui|{
                 ui.separator();
-                setting_row(ui,"常用浏览器","自动识别 Chrome、Edge、夸克等浏览器",&mut settings.avoid_browsers);
+                setting_row(ui,"常用浏览器","前台浏览器窗口遮住岛时避让",&mut settings.avoid_browsers);
                 ui.separator();
                 crate::extras::settings_control_row(ui,"自定义应用",100.0,|ui|{
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui|{
@@ -77,7 +77,7 @@ impl Picker {
                 });
                 if let Some(index)=remove{settings.avoid_apps.remove(index);}
                 ui.add_space(5.0);
-                ui.label(egui::RichText::new("无需全屏或最大化；窗口移开或切换应用后恢复。").size(11.0).weak());
+                ui.label(egui::RichText::new("自定义应用的任一窗口在前台时都会避让，包括副屏窗口。").size(11.0).weak());
             });
         });
     }
@@ -137,6 +137,14 @@ impl Picker {
                 let selected=self.entries.iter().find(|a|self.selected.as_ref().is_some_and(|p|same_app(p,&a.path)) && Self::reason(a,settings).is_none());
                 if ui.add_enabled(selected.is_some(),egui::Button::new("添加").min_size(egui::vec2(72.0,30.0))).clicked(){
                     let app=selected.unwrap();settings.avoid_apps.push((app.path.clone(),app.name.clone()));close=true;
+                }
+                let can_add_all=self.rx.is_none() && self.error.is_empty() && entries.iter().any(|app|Self::reason(app,settings).is_none());
+                if ui.add_enabled(can_add_all,egui::Button::new("全部添加").min_size(egui::vec2(80.0,30.0)))
+                    .on_hover_text("添加当前列表中所有可添加的应用").clicked(){
+                    for app in &entries {
+                        if Self::reason(app,settings).is_none(){settings.avoid_apps.push((app.path.clone(),app.name.clone()));}
+                    }
+                    close=true;
                 }
                 if ui.add_sized([72.0,30.0],egui::Button::new("取消")).clicked(){close=true;}
             });
