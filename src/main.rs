@@ -351,6 +351,7 @@ impl eframe::App for Shell {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        daozai::resources::FRAMES.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
         let frame_start=Instant::now();
         if self.resource_at.ready(Duration::from_secs(30)){
             let (count,bytes)={let textures=ctx.tex_manager();let textures=textures.read();(textures.num_allocated(),textures.allocated().map(|(_,info)|info.bytes_used()).sum())};
@@ -631,7 +632,7 @@ impl eframe::App for Shell {
                     // 拖动、悬停等有输入时满帧跟手；歌词滚动这类自己在动的画面约 30 帧/秒读回，
                     // 未到间隔就预约一次重绘，到时补上读回，动画停下时的最后一帧不会漏掉。
                     let now=Instant::now();
-                    match daozai::layered::readback_delay(self.readback_at,now,other_input) {
+                    match daozai::layered::readback_delay(self.readback_at,now,other_input,out.repaint_after) {
                         None=>{self.readback_at=Some(now);ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));}
                         Some(wait)=>ctx.request_repaint_after(wait),
                     }
