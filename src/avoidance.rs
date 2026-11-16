@@ -41,7 +41,7 @@ impl Picker {
     pub(crate) fn settings(&mut self,ui:&mut egui::Ui,settings:&mut Settings) {
         settings_label(ui,"自动避让");
         settings_card(ui,|ui|{
-            setting_row(ui,"自动避让","使用下列应用时，岛会收成细线",&mut settings.browser_minimal);
+            setting_row(ui,"自动避让","下列应用遮住岛时，岛会收成细线",&mut settings.browser_minimal);
             ui.add_enabled_ui(settings.browser_minimal,|ui|{
                 ui.separator();
                 setting_row(ui,"常用浏览器","前台浏览器窗口遮住岛时避让",&mut settings.avoid_browsers);
@@ -77,7 +77,7 @@ impl Picker {
                 });
                 if let Some(index)=remove{settings.avoid_apps.remove(index);}
                 ui.add_space(5.0);
-                ui.label(egui::RichText::new("自定义应用的任一窗口在前台时都会避让，包括副屏窗口。").size(11.0).weak());
+                ui.label(egui::RichText::new("切到插件浮窗时，宿主窗口仍遮住岛就会继续避让。").size(11.0).weak());
             });
         });
     }
