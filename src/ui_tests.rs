@@ -1166,6 +1166,7 @@ struct H {
     region:Rect,
     hit:Rect,
     animating:bool,
+    page_transition:bool,
     shapes:Vec<egui::epaint::ClippedShape>,
     bt: Vec<crate::bt::Device>,
     media: crate::smtc::NowPlaying,
@@ -1186,7 +1187,7 @@ impl H {
         std::env::set_var("DAOZAI_DATA_DIR", &dir);
         let ctx = egui::Context::default();
         let app = App::new(&ctx, Options { fetch_lyrics: false, pet_idle: 1e9 });
-        Self { ctx, app, t: 0.0, cursor: None,cmds:vec![],region:Rect::NOTHING,hit:Rect::NOTHING,animating:false,shapes:Vec::new(), bt:Vec::new(),media:Default::default(),power:(None,false),network:None,system_idle:None,screen_locked:false,fullscreen:false,browser_at_top:None,file_drop_zone:None,hovered_files:vec![],dropped_files:vec![] }
+        Self { ctx, app, t: 0.0, cursor: None,cmds:vec![],region:Rect::NOTHING,hit:Rect::NOTHING,animating:false,page_transition:false,shapes:Vec::new(), bt:Vec::new(),media:Default::default(),power:(None,false),network:None,system_idle:None,screen_locked:false,fullscreen:false,browser_at_top:None,file_drop_zone:None,hovered_files:vec![],dropped_files:vec![] }
     }
     fn frame(&mut self, events: Vec<egui::Event>) {
         self.t += 1.0 / 60.0;
@@ -1222,12 +1223,13 @@ impl H {
         let region=&mut self.region;
         let hit=&mut self.hit;
         let animating=&mut self.animating;
+        let page_transition=&mut self.page_transition;
         let app = &mut self.app;
         let file_drop_zone=&mut self.file_drop_zone;
         let output = self.ctx.run(raw, |ctx| {
             egui::CentralPanel::default().frame(egui::Frame::new()).show(ctx, |ui| {
                 let win = Rect::from_min_size(ui.max_rect().min,Vec2::new(WIN_W,WIN_H));
-                let frame=app.frame(ui, win, &env);*region=frame.region;*hit=frame.hit;*animating=frame.animating;*file_drop_zone=frame.file_drop_zone;cmds.extend(frame.cmds);
+                let frame=app.frame(ui, win, &env);*region=frame.region;*hit=frame.hit;*animating=frame.animating;*page_transition=frame.page_transition;*file_drop_zone=frame.file_drop_zone;cmds.extend(frame.cmds);
             });
         });
         self.shapes=output.shapes;
@@ -2657,6 +2659,24 @@ fn wheel_clipboard_stays_at_both_edges() {
         }
     }
 }
+#[test]
+fn wheel_page_transition_keeps_interactive_frames_after_input_stops() {
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    let mut h=H::new();
+    h.hover(Pos2::new(WIN_W/2.0,12.0),1.0);
+    h.hover(H::local(210.0,18.0),0.3);
+    assert!(!h.page_transition);
+    h.wheel(-40.0);
+    assert_eq!(h.app.page,1);
+    assert!(h.page_transition);
+    for _ in 0..18 {
+        h.frame(vec![]);
+        assert!(h.page_transition,"松开滚轮后，仍然可见的翻页动画应继续逐帧显示");
+    }
+    for _ in 0..24 {h.frame(vec![]);}
+    assert!(!h.page_transition,"翻页结束后应恢复原刷新策略");
+}
+
 #[test]
 fn wheel_handles_small_deltas_without_skipping_pages_on_bursts(){
     let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());let mut h=H::new();

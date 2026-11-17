@@ -191,9 +191,9 @@ impl CaptureState {
         let format = self.texture.format();
         let tex_extent = self.texture.size();
         let padding = self.padding;
-        let to_rgba = match format {
-            wgpu::TextureFormat::Rgba8Unorm => [0, 1, 2, 3],
-            wgpu::TextureFormat::Bgra8Unorm => [2, 1, 0, 3],
+        let bgra = match format {
+            wgpu::TextureFormat::Rgba8Unorm => false,
+            wgpu::TextureFormat::Bgra8Unorm => true,
             _ => {
                 log::error!("Screen can't be captured unless the surface format is Rgba8Unorm or Bgra8Unorm. Current surface format is {:?}", format);
                 return;
@@ -206,21 +206,7 @@ impl CaptureState {
             }
             let buffer_slice = buffer.slice(..);
 
-            let mut pixels = Vec::with_capacity((tex_extent.width * tex_extent.height) as usize);
-            for padded_row in buffer_slice
-                .get_mapped_range()
-                .chunks(padding.padded_bytes_per_row as usize)
-            {
-                let row = &padded_row[..padding.unpadded_bytes_per_row as usize];
-                for color in row.chunks(4) {
-                    pixels.push(epaint::Color32::from_rgba_premultiplied(
-                        color[to_rgba[0]],
-                        color[to_rgba[1]],
-                        color[to_rgba[2]],
-                        color[to_rgba[3]],
-                    ));
-                }
-            }
+            let pixels = capture_pixels(&buffer_slice.get_mapped_range(), padding, bgra);
             buffer.unmap();
 
             tx.send((
@@ -243,6 +229,36 @@ impl CaptureState {
 struct BufferPadding {
     unpadded_bytes_per_row: u32,
     padded_bytes_per_row: u32,
+}
+
+fn capture_pixels(mapped: &[u8], padding: BufferPadding, bgra: bool) -> Vec<epaint::Color32> {
+    let rows = mapped.chunks_exact(padding.padded_bytes_per_row as usize);
+    let width_bytes = padding.unpadded_bytes_per_row as usize;
+    let mut pixels = Vec::with_capacity(rows.len() * (width_bytes / 4));
+    for row in rows {
+        let row = &row[..width_bytes];
+        if bgra {
+            let colors: &[[u8; 4]] = bytemuck::cast_slice(row);
+            pixels.extend(colors.iter().map(|&[b, g, r, a]| epaint::Color32::from_rgba_premultiplied(r, g, b, a)));
+        } else {
+            pixels.extend_from_slice(bytemuck::cast_slice(row));
+        }
+    }
+    pixels
+}
+
+#[cfg(test)]
+#[test]
+fn captures_both_channel_orders_without_row_padding() {
+    let padding = BufferPadding { unpadded_bytes_per_row: 4, padded_bytes_per_row: 8 };
+    let rows = [8, 4, 2, 16, 99, 99, 99, 99, 3, 6, 9, 12, 77, 77, 77, 77];
+    for (bgra, expected) in [
+        (false, [[8, 4, 2, 16], [3, 6, 9, 12]]),
+        (true, [[2, 4, 8, 16], [9, 6, 3, 12]]),
+    ] {
+        let pixels = capture_pixels(&rows, padding, bgra);
+        assert_eq!(bytemuck::cast_slice::<_, [u8; 4]>(&pixels), &expected);
+    }
 }
 
 impl BufferPadding {

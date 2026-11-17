@@ -432,6 +432,8 @@ pub struct FrameOut {
     pub expanded: bool,
     pub editing: bool,
     pub animating: bool,
+    /// 当前帧正在绘制翻页过渡。
+    pub page_transition: bool,
     pub repaint_after: std::time::Duration,
     pub cmds: Vec<Cmd>,
 }
@@ -2119,10 +2121,11 @@ impl App {
             let fit=if self.island_lyrics_active()||self.notice.is_some(){1.0}else{((WIN_W-32.0)/self.resident.target.width).min(1.0)};
             self.pet.draw(&base.scaled(cx-origin.x,15.0,fit).shifted(0.0,y).faded(pet_alpha),cx-origin.x+self.resident.position(bar::PET),self.t,self.skin_palette());
         }
+        let mut page_transition=false;
         if reveal > 0.004 && !banner && !restoring_lyrics {
             let c = base.shifted(0.0, (1.0 - reveal) * -5.0).faded(reveal);
             let c = if reveal < 0.6 { c.ghost() } else { c };
-            if self.calendar.draft.is_some(){self.draw_calendar_editor(&c);}else if self.task_dialog.is_some(){self.draw_task_editor(&c);}else{self.panel_body(&c, env, &mut cmds);}
+            if self.calendar.draft.is_some(){self.draw_calendar_editor(&c);}else if self.task_dialog.is_some(){self.draw_task_editor(&c);}else{page_transition=self.panel_body(&c, env, &mut cmds);}
             if !self.toast_below {self.toast_layer(&c,106.0);}
         }
         // 岛下的确认提示使用独立裁剪区域，收起时跟随岛体下沿。
@@ -2237,6 +2240,7 @@ impl App {
             expanded: self.open,
             editing: self.is_editing(),
             animating,
+            page_transition,
             repaint_after,
             cmds,
         }
@@ -3000,7 +3004,7 @@ impl App {
     // ---------------------------------------------------------------
     // 面板主体：页标题 + 页面（带切页过渡）+ 翻页箭头 + 页码豆
     // ---------------------------------------------------------------
-    fn panel_body(&mut self, c: &Card, env: &Env, cmds: &mut Vec<Cmd>) {
+    fn panel_body(&mut self, c: &Card, env: &Env, cmds: &mut Vec<Cmd>) -> bool {
         let settings=c.hit(380.0,4.0,28.0,28.0,"page-settings").on_hover_text(format!("打开{}设置窗口",PAGE_NAMES[self.page]));
         let (hover,press)=c.hover_t(&settings);
         c.circle(394.0,18.0,13.0,Color32::from_white_alpha((hover*24.0) as u8));
@@ -3016,7 +3020,7 @@ impl App {
             if c.hit(9.0,7.0,28.0,23.0,"subpage-back").clicked(){
                 if self.page==2 && self.health_time {self.health_time=false;} else {self.subpage=None;self.settings_editing=false;}
             }
-            self.page_settings(c);self.nav(c);return;
+            self.page_settings(c);self.nav(c);return false;
         }
         let e = self.page_e();
         let in_tx = e < 0.55 && self.page_from != self.page;
@@ -3041,6 +3045,7 @@ impl App {
         }
         self.nav(c);
         if self.page==0 && c.live {self.draw_music_volume(c,cmds);}
+        in_tx
     }
 
     fn page_title(&self, page: usize, c: &Card) {

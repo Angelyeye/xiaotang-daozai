@@ -374,7 +374,9 @@ impl eframe::App for Shell {
         // 设置里改了岛体大小：下一帧起主窗口按新倍率栅格化，定位逻辑随像素比变化同步调整画布。
         #[cfg(windows)] eframe::set_root_viewport_scale(self.app.settings.island_scale());
         #[cfg(windows)]
-        {
+        if let Some(start)=_frame.interactive_frame_start {
+            self.frame_at=start;
+        } else {
             // 用帧间隔限制刷新，绕过部分 Intel 驱动在垂直同步中的忙等待。
             let delay=Duration::from_secs_f64(1.0/60.0).saturating_sub(self.frame_at.elapsed());
             if !delay.is_zero(){std::thread::sleep(delay);}
@@ -630,12 +632,19 @@ impl eframe::App for Shell {
                     i.events.iter().any(|e|!matches!(e,egui::Event::Screenshot{..})),
                 ));
                 let changed=shot.as_ref().is_some_and(|image|native.present_frame(image.size,image.as_raw()));
-                if shot.is_none() || changed || other_input {
-                    // 拖动、悬停等有输入时满帧跟手；歌词滚动这类自己在动的画面约 30 帧/秒读回，
-                    // 未到间隔就预约一次重绘，到时补上读回，动画停下时的最后一帧不会漏掉。
+                let turning=out.page_transition && !self.hidden;
+                let interactive=other_input || turning;
+                if shot.is_none() || changed || interactive {
+                    // 翻页期间即使滚轮已经停下，也要交付当前帧；持续动效仍按自身的低频节奏读回。
                     let now=Instant::now();
-                    match daozai::layered::readback_delay(self.readback_at,now,other_input,out.repaint_after) {
-                        None=>{self.readback_at=Some(now);ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));}
+                    match daozai::layered::readback_delay(self.readback_at,now,interactive,out.repaint_after) {
+                        None=>{
+                            self.readback_at=Some(now);
+                            let data=if turning && self.app.render_compat_running {
+                                egui::UserData::new(eframe::InteractiveCapture(self.frame_at+out.repaint_after))
+                            } else {Default::default()};
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(data));
+                        }
                         Some(wait)=>ctx.request_repaint_after(wait),
                     }
                 }
@@ -792,7 +801,10 @@ impl eframe::App for Shell {
         #[cfg(not(windows))] let autostart = false;
         self.app.settings_ui(ctx, autostart);
         self.app.mail_reader_ui(ctx);
-        #[cfg(windows)] let repaint_after=if self.hidden{Duration::from_secs(1)}else{out.repaint_after};
+        // 翻页以帧起点为准，扣掉本帧已花的时间；入口处的限帧仍然生效。
+        #[cfg(windows)] let repaint_after=if self.hidden {Duration::from_secs(1)}
+            else if out.page_transition {out.repaint_after.saturating_sub(self.frame_at.elapsed())}
+            else {out.repaint_after};
         #[cfg(not(windows))] let repaint_after=out.repaint_after;
         schedule_repaint(ctx,repaint_after);
         // 只记慢帧：卡顿反馈时能直接看出是渲染慢还是输入被吞（页面/展开状态一并记下）。
