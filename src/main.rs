@@ -551,6 +551,8 @@ impl eframe::App for Shell {
             }
         }
         let env = self.env(ctx);
+        #[cfg(windows)]
+        if self.native.as_ref().is_some_and(|w|w.page_scroll_cancelled()) {self.app.cancel_page_scroll();}
         self.reconcile_modules(ctx);
         // v0.5.5 邮件：开关 / 间隔 / 账号清单变了就重新对齐收信线程，再把事件交给界面。
         // 每帧只比较不复制，确有变化时才复制账号清单。
@@ -653,6 +655,7 @@ impl eframe::App for Shell {
             // 保留主窗口的事件循环，避免全屏隐藏后设置窗口无法关闭或重新打开。
             let region=if self.hidden {(0.0,0.0,0.0,0.0)} else {r(out.region)};
             let hit=if self.hidden || out.click_through && out.notice_hit.is_none() {(0.0,0.0,0.0,0.0)} else {r(out.hit)};
+            native.set_page_scroll_area(out.page_scroll_area.filter(|_|!self.hidden && out.expanded),ctx.pixels_per_point());
             native.update(region, hit, if self.hidden{None}else{out.notice_hit.map(r)},if self.hidden{None}else{out.file_drop_zone.map(r)},if self.hidden{None}else{out.glass.as_deref()},ctx.pixels_per_point(), out.editing, !self.hidden && out.expanded);
             if !self.hidden && self.app.settings.avoids_top_bar() && self.app.settings.top_bar_on_top && !self.app.settings.dock.is_side() {
                 if let Some(display)=daozai::display_layout::selected(&self.app.displays,&self.app.settings.display_id) {

@@ -87,6 +87,7 @@ const HOVER_INTENT: f64 = 0.20;
 const MINIMAL_HOVER_INTENT: f64 = 0.40;
 /// 移开后等待多久开始收起；这段时间内回来不会收。
 const LEAVE_DELAY: f64 = 0.12;
+const PAGE_EDGE_OVERLAP: f32 = 8.0;
 const SWELL: (f32, f32) = (1.075, 1.13);
 // 展开：欠阻尼，末段约 5% 过冲后回落；高度略软于宽度，像「垂落」下来。
 const OPEN_W: (f32, f32) = (330.0, 0.70);
@@ -423,6 +424,8 @@ pub struct FrameOut {
     pub glass: Option<Vec<GlassShape>>,
     /// 鼠标命中区（相对 `win` 左上角），区域外点击穿透到下层窗口。
     pub hit: Rect,
+    /// 切到较矮页面时，原页边缘临时保留的续滚范围，不参与绘制或点击命中。
+    pub page_scroll_area: Option<Rect>,
     /// 极简细条只感应悬停，鼠标点击交给下面的应用。
     pub click_through: bool,
     pub notice_hit: Option<Rect>,
@@ -734,6 +737,7 @@ pub struct App {
     // 切页
     pub(crate) page: usize,
     page_from: usize,
+    page_scroll_area: Option<Rect>,
     page_dir: f32,
     page_t0: f64,
     slide: Spring,
@@ -932,6 +936,7 @@ impl App {
             grip_hover_since: None,
             page: initial_page,
             page_from: initial_page,
+            page_scroll_area: None,
             page_dir: 1.0,
             page_t0: -10.0,
             slide: Spring::new(0.0, 260.0, 0.92),
@@ -1796,6 +1801,10 @@ impl App {
         (self.h.pos - bh) / (self.expanded_height() - bh)
     }
 
+    pub fn cancel_page_scroll(&mut self) {
+        self.page_scroll_area=None;
+    }
+
     pub(crate) fn expanded_height(&self)->f32 {
         if self.page==CALENDAR_PAGE {CALENDAR_H}else if self.page==WEATHER_PAGE {WEATHER_H}else if self.page==6{176.0}else if self.page==5&&self.mail.open_uid.is_some(){236.0}else{PH}
     }
@@ -1909,8 +1918,13 @@ impl App {
         // ---------- 输入：悬停 ----------
         let p_prev = self.progress();
         let hit = if side {self.side_hit_rect(win,p_prev)} else {self.hit_rect(cx, top, p_prev)};
+        let page_before=self.page;
         let previous_menu=self.shelf_menu_rect.take();
         let inside = env.cursor.is_some_and(|c| hit.contains(c) || previous_menu.is_some_and(|r|r.contains(c)));
+        self.page_scroll_area=self.page_scroll_area.filter(|area|self.open && !self.hover_lock
+            && !env.fullscreen_hidden && !env.screen_locked && env.cursor.is_some_and(|c|area.contains(c))
+            && !ctx.input(|i|i.pointer.any_pressed() || i.key_pressed(egui::Key::Escape)));
+        let page_hover=inside || self.page_scroll_area.is_some();
         let on_notice=env.cursor.is_some_and(|c|self.messenger_badge_rect(win,self.island_rect(win,self.w.pos,self.h.pos)).is_some_and(|r|r.contains(c)) || self.notice_rect(cx,top).is_some_and(|r|r.contains(c))||self.notice_details_rect(cx,top).is_some_and(|r|r.contains(c)));
         if !inside {
             self.hover_lock = false;
@@ -1927,7 +1941,7 @@ impl App {
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) && self.is_editing() {
             self.cancel_edit();
         }
-        if (!self.is_editing() || self.todo_choosing) && inside && self.open && self.reveal > 0.95 {
+        if (!self.is_editing() || self.todo_choosing) && page_hover && self.open && self.reveal > 0.95 {
             let (scroll, left, right, esc) = ctx.input(|i| (i.raw_scroll_delta.y, i.key_pressed(egui::Key::ArrowLeft), i.key_pressed(egui::Key::ArrowRight), i.key_pressed(egui::Key::Escape)));
             if esc { self.hover_lock = true; }
             if (left || right) && !self.todo_choosing {
@@ -1935,7 +1949,7 @@ impl App {
                 self.navigate_page(right);
             } else if scroll!=0.0 {
                 let cursor=env.cursor.unwrap()-self.content_origin(win).to_vec2();
-                let mail_reading=self.page==5 && self.mail.open_uid.is_some();
+                let mail_reading=inside && self.page==5 && self.mail.open_uid.is_some();
                 let mail_list=self.page==5 && !self.mail.accounts.is_empty() && self.mail.open_uid.is_none() && self.mail_list_bounds().contains(cursor);
                 let music_volume=self.page==0 && (Rect::from_min_max(Pos2::new(354.0,106.0),Pos2::new(380.0,130.0)).contains(cursor)
                     || self.music_volume_open && crate::pages::MUSIC_VOLUME_RECT.contains(cursor));
@@ -1978,7 +1992,7 @@ impl App {
             }
         } else {self.wheel_delta=0.0;}
         let volume_dragging=self.music_volume_open && ctx.is_being_dragged(egui::Id::new(("card-drag",true,"m-volume-track")));
-        let want = (inside && !self.hover_lock && (self.compact_notices()||self.notice.is_none()||self.open)) || self.open && on_notice || (self.open && self.t<self.forced_open_until) || self.drag_hot || volume_dragging || (self.is_editing() && self.open);
+        let want = (page_hover && !self.hover_lock && (self.compact_notices()||self.notice.is_none()||self.open)) || self.open && on_notice || (self.open && self.t<self.forced_open_until) || self.drag_hot || volume_dragging || (self.is_editing() && self.open);
         self.morph(want, inside, env.t, dt);
         self.update_pet(env, cx);
 
@@ -2230,10 +2244,27 @@ impl App {
         // 交互形变保持 60 帧，媒体 30 帧；小表情 20 帧，睡眠 10 帧，静态界面每秒核对提醒。
         let repaint_after=std::time::Duration::from_secs_f64(if transitioning{1.0/60.0}else if ambient{1.0/30.0}else if pet_visible{if self.pet.state==PetState::Sleeping{0.1}else{0.05}}else{1.0});
         cmds.append(&mut self.pending);
+        let next_hit=if side {self.side_hit_rect(win,self.progress())} else {self.hit_rect(cx,top,self.progress())};
+        if page_before!=self.page && self.open {
+            let previous=self.page_scroll_area.map_or(hit,|area|hit.union(area));
+            // 保留缩短一侧原有的整段宽度。和新页重叠一点，避免在边缘来回挪动时误收起。
+            self.page_scroll_area=env.cursor.filter(|&c|previous.contains(c)).and_then(|c|{
+                let mut band=previous;
+                if previous.bottom()>next_hit.bottom() && c.y>=next_hit.bottom()-PAGE_EDGE_OVERLAP {
+                    band.min.y=next_hit.bottom()-PAGE_EDGE_OVERLAP;
+                } else if previous.top()<next_hit.top() && c.y<=next_hit.top()+PAGE_EDGE_OVERLAP {
+                    band.max.y=next_hit.top()+PAGE_EDGE_OVERLAP;
+                } else {
+                    return None;
+                }
+                Some(band)
+            });
+        }
         FrameOut {
             region: rel(floating_toast.into_iter().chain(self.shelf_menu_rect.map(|r|r.union(r + ctx.style().visuals.popup_shadow.margin()).expand(1.0 / ctx.pixels_per_point()))).fold(region,Rect::union).intersect(ui.max_rect())),
             glass: glass_region,
-            hit: rel(if side {self.side_hit_rect(win,self.progress())} else {self.hit_rect(cx, top, self.progress())}),
+            hit: rel(next_hit),
+            page_scroll_area:self.page_scroll_area.map(rel),
             click_through: minimal_strip && !self.open && self.position_drag.is_none(),
             notice_hit:notice_shape.into_iter().chain(notice_details).chain(messenger_rect).chain(self.shelf_menu_rect).reduce(|a,b|a.union(b)).map(rel),
             file_drop_zone:self.settings.visible_pages[3].then(||rel(if side {self.island_rect(win,PW,self.expanded_height())} else {Rect::from_min_size(Pos2::new(cx-PW/2.0,top),Vec2::new(PW,96.0))})),

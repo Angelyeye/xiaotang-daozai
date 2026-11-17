@@ -2577,6 +2577,73 @@ fn wheel_navigation_reaches_every_page_in_both_directions(){
 }
 
 #[test]
+fn wheel_from_tall_page_allows_movement_in_previous_page_bounds() {
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    let mut h=H::new();
+    let edge=H::local(70.0,165.0);
+    let inner=H::local(70.0,80.0);
+    h.hover(Pos2::new(WIN_W/2.0,12.0),1.0);
+    h.app.go(6,1.0);
+    h.hover(edge,0.8);
+    h.wheel(40.0);
+    assert_eq!(h.app.page,5);
+    for _ in 0..90 {h.frame(vec![]);}
+    assert!(h.app.open && !h.hit.contains(edge),"原位保留翻页意图，岛外仍可点击桌面");
+    assert!((h.app.h.pos-PH).abs()<0.1 && (h.hit.height()-PH-2.0).abs()<0.1,"矮页应使用自身高度");
+    h.hover(H::local(180.0,174.0),0.4);
+    assert!(h.app.open,"在上一页范围内向侧下方移动仍可阅读");
+    h.hover(H::local(220.0,PH-1.0),0.4);
+    h.hover(H::local(250.0,157.0),0.4);
+    assert!(h.app.open,"轻微穿过新页边缘再移回来不应误收起");
+    h.wheel(40.0);
+    assert_eq!(h.app.page,4);
+    h.hover(inner,0.5);
+    assert!(h.app.open && !h.hit.contains(edge),"移入新页后恢复该页高度");
+    h.hover(edge,0.5);
+    assert!(!h.app.open,"重新移出新页应正常收起");
+
+    h.hover(Pos2::new(WIN_W/2.0,12.0),1.0);
+    h.app.go(6,1.0);
+    h.hover(H::local(70.0,PH-1.0),0.8);
+    h.wheel(40.0);
+    h.hover(edge,0.4);
+    assert!(h.app.open,"翻页时光标刚好在新边缘内，也能顺势移到旧页范围");
+    h.hover(H::local(-25.0,165.0),0.5);
+    assert!(!h.app.open,"直接移出原岛体也应正常收起");
+}
+
+#[test]
+fn side_docks_keep_both_edges_when_turning_to_a_shorter_page() {
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    for dock in [crate::model::Dock::Left,crate::model::Dock::Right] {
+        let mut h=H::new();
+        h.app.settings.dock=dock;
+        let x=if dock==crate::model::Dock::Left {1.0}else{crate::side_dock::SIDE_W-1.0};
+        let resident=Pos2::new(x,crate::side_dock::SIDE_H/2.0);
+        for _ in 0..60 {side_frame(&mut h,Some(resident));}
+        assert!(h.app.open);
+        for sign in [-1.0,1.0] {
+            h.app.go(6,1.0);
+            let tall=side_frame(&mut h,Some(resident)).hit;
+            let edge=tall.center()+Vec2::new(0.0,sign*83.0);
+            for _ in 0..45 {side_frame(&mut h,Some(edge));}
+            side_frame_events(&mut h,Some(edge),vec![egui::Event::MouseWheel {
+                unit:egui::MouseWheelUnit::Point,delta:Vec2::new(0.0,40.0),modifiers:Default::default(),
+            }]);
+            assert_eq!(h.app.page,5);
+            let moved=edge+Vec2::new(65.0,4.0*sign);
+            for _ in 0..45 {side_frame(&mut h,Some(moved));}
+            let out=side_frame(&mut h,Some(moved));
+            assert!(out.expanded && !out.hit.contains(moved) && out.page_scroll_area.is_some_and(|r|r.contains(moved)),
+                "{dock:?} 原页上下边缘的空白处应可移动并续滚");
+            assert!((h.app.h.pos-PH).abs()<0.1);
+            let out=side_frame(&mut h,Some(tall.center()));
+            assert!(out.expanded && !out.hit.contains(edge),"{dock:?} 移入矮页后应恢复高度");
+        }
+    }
+}
+
+#[test]
 fn wheel_scrolls_lists_only_inside_content_and_respects_edges(){
     let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());let mut h=H::new();
     h.app.todos.items=(0..4).map(|i|crate::model::TodoItem{text:format!("任务 {i}"),done_on:None,due:None,reminded:false,..Default::default()}).collect();
@@ -7466,11 +7533,15 @@ fn side_frame_with(h:&mut H,cursor:Option<Pos2>)->crate::app::FrameOut{
 }
 
 fn side_frame(h:&mut H,cursor:Option<Pos2>)->crate::app::FrameOut{
+    side_frame_events(h,cursor,cursor.map(|p|vec![egui::Event::PointerMoved(p)]).unwrap_or_default())
+}
+
+fn side_frame_events(h:&mut H,cursor:Option<Pos2>,events:Vec<egui::Event>)->crate::app::FrameOut{
     let (w,hgt)=(crate::side_dock::SIDE_W,crate::side_dock::SIDE_H);
     h.t+=1.0/60.0;
     let env=Env{t:h.t,clock:"09:41:00".into(),today:"2026-11-04".into(),date:"11月4日 周三".into(),cursor,bt_ready:true,battery:Some(76),..Default::default()};
     let raw=egui::RawInput{screen_rect:Some(Rect::from_min_size(Pos2::ZERO,Vec2::new(w,hgt))),time:Some(h.t),focused:true,
-        events:cursor.map(|p|vec![egui::Event::PointerMoved(p)]).unwrap_or_default(),..Default::default()};
+        events,..Default::default()};
     let app=&mut h.app;let mut out=None;
     let output=h.ctx.run(raw,|ctx|{egui::CentralPanel::default().frame(egui::Frame::new()).show(ctx,|ui|{out=Some(app.frame(ui,Rect::from_min_size(ui.max_rect().min,Vec2::new(w,hgt)),&env));});});
     h.shapes=output.shapes;
