@@ -1703,7 +1703,10 @@ impl App {
             } else {self.media.title.trim()};
         let ink=if current.is_some()||title{theme::WHITE}else{theme::GRAY};
         let layout=|text:String| {
-            let mut job=egui::text::LayoutJob::simple(text,theme::font(11.0,W::Semibold),ink,LYRIC_BAR_W-80.0);
+            // 维语等从右往左的歌词：先按阅读顺序分行再逐行转换，否则折行后第一行会是句子的结尾（#200）。
+            let font=theme::font(11.0,W::Semibold);
+            let text=crate::rtl_text::display_wrapped(&text,LYRIC_BAR_W-80.0,|s|ctx.fonts(|fonts|fonts.layout_no_wrap(s.to_owned(),font.clone(),ink).size().x)).into_owned();
+            let mut job=egui::text::LayoutJob::simple(text,font,ink,LYRIC_BAR_W-80.0);
             job.halign=egui::Align::Center;
             job.wrap.break_anywhere=true;
             if title {job.wrap.max_rows=1;}

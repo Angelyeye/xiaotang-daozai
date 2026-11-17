@@ -253,6 +253,60 @@ fn weather_foundation_preview(){
     }
 }
 
+/// #200：维语、藏语歌曲在收起的岛上歌词和音乐页里的显示，导出修复前后对照图。
+/// 运行：设置 DAOZAI_SCRIPT_PREVIEW_DIR 后执行 `cargo test complex_script_lyrics_preview -- --ignored`。
+#[test]
+#[ignore="按需导出维语、藏语歌词的修复前后对照图"]
+fn complex_script_lyrics_preview(){
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    let dest=std::path::PathBuf::from(std::env::var_os("DAOZAI_SCRIPT_PREVIEW_DIR").expect("需指定预览目录"));std::fs::create_dir_all(&dest).unwrap();
+    let songs=[
+        ("uyghur","سۆيگۈ دېگەن شۇنداق بولامدۇ","رەيىمجان ئابدۇكېيۇم",
+            "[00:01]سۆيگۈ دېگەن شۇنداق بولامدۇ\n[00:05]يايرىم سېنى سېغىندىم شۇنچە (2024)\n[00:09]كۆڭلۈمدىكى سۆزلەرنى ساڭا ئېيتاي دېسەم سەن يوق\n[00:13]سۆيگۈ دېگەن شۇنداق بولامدۇ"),
+        ("tibetan","ཕ་ཡུལ་གྱི་དྲན་པ།","ཚེ་དབང་ལྷ་མོ།",
+            "[00:01]བཀྲ་ཤིས་བདེ་ལེགས།\n[00:05]སྐྱིད་པོའི་གྲོགས་པོ་ཁྱེད་རང་ཡིན།\n[00:09]ཕ་ཡུལ་གྱི་རི་བོ་མཐོན་པོ།\n[00:13]སྙིང་གི་གཏམ་བརྗོད།"),
+    ];
+    for fixed in [false,true] {
+        crate::rtl_text::BYPASS.store(!fixed,std::sync::atomic::Ordering::Relaxed);
+        for (name,title,artist,lrc) in songs {
+            for open in [false,true] {
+                let mut h=H::new();h.app.settings.pet=false;
+                if !fixed {h.ctx.set_fonts(crate::theme::fonts_without_tibetan());}
+                h.app.opts.fetch_lyrics=true;h.app.settings.island_lyrics=true;h.app.show_lyrics=true;
+                let media=crate::smtc::NowPlaying{source:"cloudmusic.exe".into(),title:title.into(),artist:artist.into(),duration:215.0,playing:true,position:7.0,
+                    playback_type:crate::smtc::MediaKind::Music,..Default::default()};
+                h.media=media.clone();h.frame(vec![]);
+                h.app.ly=crate::app::LyricsState{key:format!("{}|{}|{:.0}",media.title,media.artist,media.duration),
+                    song:Some(crate::app::LyricSong{source:media.source.clone(),title:media.title.clone(),artist:media.artist.clone(),duration:media.duration,song_id:None}),
+                    lyrics:Some(crate::lyrics::parse_lrc(lrc)),..Default::default()};
+                if open {h.app.show_page(0);}
+                let (w,hgt)=(crate::app::CANVAS_W,WIN_H);
+                let mut raster=feature_raster_sized(w,hgt);
+                for frame in 0..90 {
+                    h.t+=1.0/60.0;
+                    let env=Env{t:h.t,clock:"22:08:00".into(),today:"2026-11-16".into(),date:"11月16日 周一".into(),media:h.media.clone(),bt_ready:true,..Default::default()};
+                    let raw=egui::RawInput{screen_rect:Some(Rect::from_min_size(Pos2::ZERO,Vec2::new(w,hgt))),time:Some(h.t),focused:true,
+                        viewports:std::iter::once((egui::ViewportId::ROOT,egui::ViewportInfo{native_pixels_per_point:Some(2.0),..Default::default()})).collect(),..Default::default()};
+                    let output=h.ctx.run(raw,|ctx|{egui::CentralPanel::default().frame(egui::Frame::new()).show(ctx,|ui|{
+                        h.app.frame(ui,Rect::from_min_size(ui.max_rect().min,Vec2::new(WIN_W,hgt)),&env);
+                    });});
+                    raster.update_textures(&output.textures_delta);
+                    if frame==89 {
+                        raster.buf.fill([0.20,0.24,0.32,1.0]);raster.draw(&h.ctx.tessellate(output.shapes,output.pixels_per_point),output.pixels_per_point);
+                        let mut rgba=Vec::new();raster.to_rgba8(&mut rgba);
+                        let image=image::RgbaImage::from_raw((w*2.0)as u32,(hgt*2.0)as u32,rgba).unwrap();
+                        let crop_h=if open {(h.app.expanded_height()*2.0+24.0)as u32}else{110};
+                        let file=format!("{name}-{}-{}.png",if open{"page"}else{"island"},if fixed{"after"}else{"before"});
+                        image::imageops::crop_imm(&image,200,0,880,crop_h).to_image().save(dest.join(file)).unwrap();
+                    }
+                    raster.free_textures(&output.textures_delta);
+                }
+            }
+        }
+    }
+    crate::rtl_text::BYPASS.store(false,std::sync::atomic::Ordering::Relaxed);
+}
+
 #[test]
 #[ignore="按需导出进入日照视图时的涟漪与太阳滑入过程"]
 fn weather_solar_entry_preview(){
