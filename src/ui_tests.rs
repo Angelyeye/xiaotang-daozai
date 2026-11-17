@@ -12,6 +12,8 @@ mod weather_source;
 mod lyrics_switch;
 #[path="health_reminder_ui_tests.rs"]
 mod health_reminder;
+#[path="settings_redesign_ui_tests.rs"]
+mod settings_redesign;
 use eframe::egui::{self, Pos2, Rect, Vec2};
 use std::sync::Mutex;
 
@@ -681,7 +683,7 @@ fn top_bar_settings_switch_modes_and_respect_the_master_switch(){
     }
     let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
     for dark in [true,false] {
-        let mut h=H::new();h.app.open_settings();h.ctx.set_embed_viewports(false);
+        let mut h=H::new();h.app.open_settings();h.app.settings_tab=crate::extras::SETTINGS_TAB_POSITION;h.ctx.set_embed_viewports(false);
         h.app.settings.settings_theme=if dark{crate::settings_theme::SettingsTheme::Dark}else{crate::settings_theme::SettingsTheme::Light};
         let mut raster=crate::preview_raster::Raster::new(690,1800);
         for _ in 0..3{let _=draw(&mut h,vec![],&mut raster);}
@@ -4470,7 +4472,7 @@ fn bluetooth_notices_track_multiple_devices_independently(){
 
 #[test]
 fn display_choice_saves_and_keeps_disconnected_selection(){
-    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());let mut h=H::new();h.app.settings_open=true;h.ctx.set_embed_viewports(false);
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());let mut h=H::new();h.app.settings_open=true;h.app.settings_tab=crate::extras::SETTINGS_TAB_POSITION;h.ctx.set_embed_viewports(false);
     let bounds=crate::display_layout::Bounds{left:0,top:0,right:1920,bottom:1080};
     h.app.displays=vec![
         crate::display_layout::Display{id:"internal".into(),label:"显示器 1 · 主屏".into(),bounds,work_top:0,primary:true},
@@ -5790,8 +5792,8 @@ fn weather_status_switch_controls_the_badge_and_keeps_the_page_available(){
         h.app.weather.snapshot=Some(crate::weather::Snapshot{temp:9.0,..Default::default()});
         for _ in 0..3 {draw(&mut h,vec![]);}
         let text_rect=|h:&H,label:&str|h.shapes.iter().find_map(|s|match &s.shape{egui::Shape::Text(t) if t.galley.text()==label=>Some(t.visual_bounding_rect()),_=>None}).unwrap();
-        let heading=text_rect(&h,"状态组件");let bottom=text_rect(&h,"功能页面").top();
-        let title=h.shapes.iter().find_map(|s|match &s.shape{egui::Shape::Text(t) if t.galley.text()=="天气"&&t.pos.x>=heading.left()&&t.pos.y>heading.bottom()&&t.pos.y<bottom=>Some(t.visual_bounding_rect()),_=>None}).expect("状态组件应有独立的天气开关");
+        let heading=text_rect(&h,"岛上显示");let bottom=text_rect(&h,"功能页面").top();
+        let title=h.shapes.iter().find_map(|s|match &s.shape{egui::Shape::Text(t) if t.galley.text()=="天气"&&t.pos.x>=heading.left()&&t.pos.y>heading.bottom()&&t.pos.y<bottom=>Some(t.visual_bounding_rect()),_=>None}).expect("岛上显示应有独立的天气开关");
         let point=h.shapes.iter().find_map(|s|match &s.shape{egui::Shape::Rect(r) if (r.rect.width()-34.0).abs()<0.01&&(r.rect.height()-20.0).abs()<0.01&&r.rect.center().y>title.top()&&r.rect.center().y<title.bottom()+24.0=>Some(r.rect.center()),_=>None}).unwrap();
         for expected in [false,true] {
             for pressed in [true,false] {draw(&mut h,vec![egui::Event::PointerMoved(point),egui::Event::PointerButton{pos:point,button:egui::PointerButton::Primary,pressed,modifiers:Default::default()}]);}
@@ -6040,9 +6042,12 @@ fn general_settings_controls_fit_when_resizing_to_minimum_width() {
                 viewports:std::iter::once((id,egui::ViewportInfo{native_pixels_per_point:Some(scale),..Default::default()})).collect(),..Default::default()};
             *capture.lock().unwrap()=Some(ctx.run(input,|ctx|(viewport.viewport_ui_cb)(ctx)));
         });
+        // 皮肤与大小在「外观」，位置微调在「位置」。
+        for (tab,labels) in [(crate::extras::SETTINGS_TAB_APPEARANCE,vec!["经典","奶油","毛玻璃·浅","毛玻璃·深","悬浮云","恢复默认"]),(crate::extras::SETTINGS_TAB_POSITION,vec!["恢复居中"])] {
+        h.app.settings_tab=tab;
         for _ in 0..3 {let _=h.ctx.run(Default::default(),|ctx|h.app.settings_ui(ctx,false));}
         let frame=output.lock().unwrap().take().unwrap();
-        for label in ["经典","奶油","毛玻璃·浅","毛玻璃·深","悬浮云","恢复默认","恢复居中"] {
+        for label in labels {
             let shape=frame.shapes.iter().find(|s|matches!(&s.shape,egui::Shape::Text(t) if t.galley.text()==label))
                 .unwrap_or_else(||panic!("窗口宽 {width} 时缺少控件 {label}"));
             assert!(shape.clip_rect.contains_rect(shape.shape.visual_bounding_rect()),"窗口宽 {width} 时 {label} 被裁切");
@@ -6053,6 +6058,7 @@ fn general_settings_controls_fit_when_resizing_to_minimum_width() {
                     assert!(r.rect.right()<=shape.clip_rect.right(),"窗口宽 {width} 时开关右侧被裁切");
                 }
             }
+        }
         }
     }
 }
@@ -6077,10 +6083,13 @@ fn settings_theme_follows_system_and_preserves_island_style() {
                 viewports:std::iter::once((id,egui::ViewportInfo{native_pixels_per_point:Some(1.0),..Default::default()})).collect(),..Default::default()};
             *capture.lock().unwrap()=Some(ctx.run(raw,|ctx|(viewport.viewport_ui_cb)(ctx)));
         });
-        for tab in 0..12 {
+        for tab in (0..12).chain([crate::extras::SETTINGS_TAB_APPEARANCE,crate::extras::SETTINGS_TAB_POSITION]) {
             h.app.settings_tab=tab;
             // AI 额度的添加账号表单默认收起，点「＋ 添加账号」才展开；展开后再检查表单行对齐。
             h.app.quota.connect_open=tab==11;
+            // 添加邮箱、添加日历的表单在弹窗里，打开后再检查表单行对齐。
+            h.app.mail.form.open=tab==7;
+            h.app.calendar.form.open=tab==8;
             for frame in 0..3 {
                 h.ctx.data_mut(|d|d.insert_temp(egui::Id::new("settings-system-theme"),(std::time::Instant::now(),system)));
                 let root=h.ctx.run(Default::default(),|ctx|h.app.settings_ui(ctx,false));
@@ -6093,8 +6102,8 @@ fn settings_theme_follows_system_and_preserves_island_style() {
                         1=>&[("时间偏移","0.35 秒")],
                         2=>&[("专注","25 分钟"),("休息","5 分钟")],
                         3=>&[("每日目标","2000 ml"),("每次记录","250 ml"),("提醒间隔","45 分钟"),("提醒时段","9 时")],
-                        7=>&[("验证码隐藏","60 秒"),("检查间隔","120 秒"),("会议提前","15 分钟"),("邮箱","输入邮箱地址"),("授权码","输入邮箱授权码")],
-                        8=>&[("用户名","输入用户名或粘贴账号信息"),("密码","输入平台生成的密码")],
+                        7=>&[("邮箱","输入邮箱地址"),("授权码","输入邮箱授权码")],
+                        8=>&[("会议提前","15 分钟"),("用户名","输入用户名或粘贴账号信息"),("密码","输入平台生成的密码")],
                         11=>&[("服务","Codex"),("备注","例如：个人、工作、备用"),("选择该账号的登录文件","选择…")],
                         _=>&[],
                     };
@@ -6104,11 +6113,12 @@ fn settings_theme_follows_system_and_preserves_island_style() {
                         assert!(distance<=1.0,"设置页 {tab} 的 {label} 与 {value} 未居中：{distance}");
                     }
                 }
-                if tab==0 && frame==2 {
+                if (tab==0||tab==crate::extras::SETTINGS_TAB_POSITION) && frame==2 {
                     let center=|label:&str|child.shapes.iter().find_map(|s|match &s.shape {
                         egui::Shape::Text(t) if t.galley.text()==label=>Some(t.visual_bounding_rect().center().y),_=>None,
                     }).unwrap();
-                    for (label,choices) in [("显示屏",vec!["跟随主屏"]),("时间制式",vec!["24 小时","12 小时"]),("时段文字",vec!["不显示","上午 / 下午","详细时段"])] {
+                    let rows=if tab==0 {vec![("时间制式",vec!["24 小时","12 小时"]),("时段文字",vec!["不显示","上午 / 下午","详细时段"])]} else {vec![("显示屏",vec!["跟随主屏"])]};
+                    for (label,choices) in rows {
                         for choice in choices {assert!((center(label)-center(choice)).abs()<1.0,"{label}与{choice}应垂直居中：{} / {}",center(label),center(choice));}
                     }
                 }
@@ -6589,6 +6599,10 @@ fn avoidance_picker_add_remove_and_save() {
     draw(&mut h,vec![egui::Event::Text("插件面板".into())]);
     let out=draw(&mut h,vec![]);
     click(&mut h,point(&out,"全部添加"));
+    // 全部添加需要二次确认：第一次只出现确认条，不添加。
+    assert!(h.app.avoidance.open);assert_eq!(h.app.settings.avoid_apps.len(),1,"确认前不能添加");
+    let out=draw(&mut h,vec![]);
+    click(&mut h,point(&out,"确定添加"));
     assert!(!h.app.avoidance.open);
     assert_eq!(h.app.settings.avoid_apps.iter().map(|(p,_)|p.as_str()).collect::<Vec<_>>(),["D:/one.exe","D:/two.exe","D:/three.exe"]);
     h.app.settings.save();assert_eq!(crate::model::Settings::load().avoid_apps,h.app.settings.avoid_apps);
@@ -7111,6 +7125,7 @@ fn quota_cards_expose_names_colors_settings_and_connection(){
         frame(h,vec![]);
     }
     let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());let mut h=H::new();h.quota_accounts(2);let id=h.app.quota.config.connect_deepseek("fixture".into(),"工作".into());h.app.quota_event(crate::quota::Event{id:id.clone(),result:Err("API Key 验证失败".into())});
+    open_quota_details(&h);
     for _ in 0..8{frame(&mut h,vec![]);}
     assert!(!h.shapes.iter().any(|s|matches!(&s.shape,egui::Shape::Text(t) if t.galley.text()=="备注"||t.galley.text()=="服务")));
     for label in ["颜色","监控","工作","移除","当前"]{assert!(h.shapes.iter().any(|s|matches!(&s.shape,egui::Shape::Text(t) if t.galley.text()==label)),"应直接显示 {label}");}
@@ -7606,7 +7621,7 @@ fn settings_gallery(){
     let (w,hgt)=(width,2400.0f32);
     let scale=1.5f32;
     for (mode,dark) in [(SettingsTheme::Dark,true),(SettingsTheme::Light,false)] {
-        for tab in [0usize,10,1,2,4,6,7,11,9] {
+        for tab in [0usize,13,14,10,1,2,4,6,7,8,11,12,9] {
             let mut h=H::new();h.app.open_settings();h.ctx.set_embed_viewports(false);
             h.quota_accounts(2);
             h.app.settings.settings_theme=mode;h.app.settings_tab=tab;
@@ -8366,7 +8381,7 @@ fn claude_local_only_settings_show_notice_without_manual_reset_controls(){
         let account=crate::quota::Account{id:"local-test".into(),provider:crate::quota::Provider::Claude,alias:"Claude 本地账号".into(),source:"fixture/config.json".into(),slot:Some("fixture".into()),enabled:true,pinned:true};
         h.app.quota.config.accounts.push(account.clone());
         let snapshot=crate::quota::Snapshot{at:chrono::Utc::now().timestamp(),windows:vec![crate::quota::Window{label:"5 小时".into(),seconds:Some(18000),remaining:37.5,reset:None,amount:None},crate::quota::Window{label:"本周".into(),seconds:Some(604800),remaining:62.0,reset:None,amount:None}],..Default::default()};
-        h.app.quota.rows.insert(account.id.clone(),Ok(snapshot.clone()));let mut raster=crate::preview_raster::Raster::new(640,760);
+        h.app.quota.rows.insert(account.id.clone(),Ok(snapshot.clone()));open_quota_details(&h);let mut raster=crate::preview_raster::Raster::new(640,760);
         for connection in [false,true]{
             h.app.quota.provider=crate::quota::Provider::Claude;h.app.quota.connect_open=connection;
             for _ in 0..4{frame(&mut h,&mut raster);}
@@ -8669,8 +8684,6 @@ fn quota_acceptance_relay_key_only_response_shows_balance_unavailable(){
     assert!(!h.shapes.iter().any(|s|matches!(&s.shape,egui::Shape::Text(t) if t.galley.text().contains("不限额")||t.galley.text().contains("未设置限额"))));
 }
 
-
-
 #[test]
 fn quota_acceptance_new_api_user_balance_is_visible(){
     use crate::quota::{Provider,Account,relay};
@@ -8732,6 +8745,8 @@ fn quota_cc_switch_general_and_custom_connections_render_in_both_themes(){
         h.app.quota_close_connection();assert!(h.app.quota.relay_script.is_empty()&&h.app.quota.api_key.is_empty());
     }}
 }
+
+
 
 #[test]
 fn quota_acceptance_grouped_connections_preserve_saved_sources() {
@@ -8978,10 +8993,15 @@ fn background_services_follow_the_module_switch(){
 
 #[test]
 fn every_module_settings_tab_maps_to_its_page(){
-    let titles=["常规","音乐与歌词","专注","健康提醒","待办","置物","通知","邮箱","日程","关于","页面管理","AI 额度","天气"];
+    let titles=["通用","音乐","专注","健康","待办","置物","消息提醒","邮箱","日程","关于","页面管理","AI 额度","天气","外观","位置"];
     let mut pages:Vec<_>=(0..titles.len()).filter_map(crate::extras::settings_tab_module).collect();
     for tab in 0..titles.len() {
         if let Some(page)=crate::extras::settings_tab_module(tab) {assert!(crate::app::PAGE_NAMES[page].chars().next()==titles[tab].chars().next(),"{} ↔ {}",titles[tab],crate::app::PAGE_NAMES[page]);}
     }
     pages.sort();assert_eq!(pages,(0..crate::app::PAGE_NAMES.len()).collect::<Vec<_>>(),"每个功能页面各有一个设置分页");
+}
+
+/// 设置页的 AI 额度账号默认收起成一行；需要检查明细的测试先把所有账号展开。
+pub(crate) fn open_quota_details(h:&H){
+    for account in &h.app.quota.config.accounts {h.ctx.data_mut(|d|d.insert_temp(egui::Id::new(("quota-account-open",account.id.clone())),true));}
 }

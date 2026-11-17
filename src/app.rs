@@ -576,6 +576,8 @@ pub(crate) struct MailForm {
     pub email: String,
     pub password: String,
     pub show: bool,
+    /// 设置页的「添加邮箱」弹窗是否打开。
+    pub open: bool,
 }
 
 impl MailState {
@@ -645,6 +647,8 @@ pub(crate) struct CalendarForm {
     pub password: String,
     pub show: bool,
     pub guide_open: bool,
+    /// 设置页的「添加日历」弹窗是否打开。
+    pub open: bool,
 }
 
 impl CalendarState {
@@ -1123,6 +1127,8 @@ impl App {
     /// 设置窗口第 8 个标签页：邮件。
     pub fn open_mail_settings(&mut self) {
         self.settings_tab = 7;
+        // 从岛上「去添加」进来时直接打开添加邮箱弹窗。
+        self.mail.form.open = true;
         self.open_settings();
     }
 
@@ -1563,6 +1569,21 @@ impl App {
     pub fn clipboard_active(&self)->bool {self.module_on(SHELF_PAGE) && self.settings.clipboard_history}
     /// 额度查询是否应运行：AI 额度模块开启且打开了「开启 AI 额度」。
     pub fn quota_active(&self)->bool {self.module_on(QUOTA_PAGE) && self.quota.config.enabled}
+    /// 旧版设置页里「新邮件提醒」「开启 AI 额度」与页面管理的模块开关是两层开关。
+    /// 合并后只保留模块开关：旧的内部开关关着时，迁移为模块关闭，内部开关恢复为开。
+    /// 只剩这一个页面、模块关不掉时保持原样，不改变已有行为。
+    pub fn migrate_merged_switches(&mut self){
+        let mut settings_changed=false;
+        if !self.settings.mail_enabled {
+            self.set_page_visible(MAIL_PAGE,false);
+            if !self.settings.visible_pages[MAIL_PAGE] {self.settings.mail_enabled=true;settings_changed=true;}
+        }
+        if !self.quota.config.enabled {
+            self.set_page_visible(QUOTA_PAGE,false);
+            if !self.settings.visible_pages[QUOTA_PAGE] {self.quota.config.enabled=true;self.quota.config.save();settings_changed=true;}
+        }
+        if settings_changed {self.settings.save();}
+    }
 
     pub(crate) fn set_page_visible(&mut self,page:usize,visible:bool) {
         if !visible && self.settings.visible_pages.iter().filter(|enabled|**enabled).count()==1
