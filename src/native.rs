@@ -82,6 +82,7 @@ impl DragCapture {
 fn watch_drag(hwnd:HWND,ctx:eframe::egui::Context){
     let raw=hwnd.0 as isize;
     let mut was_down=false;
+    let mut last_hover=None;
     let _=std::thread::Builder::new().name("daozai-drag-watch".into()).spawn(move||loop{
         std::thread::sleep(std::time::Duration::from_millis(80));
         unsafe {
@@ -91,9 +92,18 @@ fn watch_drag(hwnd:HWND,ctx:eframe::egui::Context){
             // 松开后补一帧，让拖放状态及时复位；否则静止时一秒才画一帧，连续点击会沿用上次的按下位置。
             if was_down && !down {ctx.request_repaint();}
             was_down=down;
-            if !down {continue;}
+            let passive=GetWindowLongPtrW(hwnd,GWL_EXSTYLE) & WS_EX_TRANSPARENT.0 as isize != 0;
+            if !down && !passive {last_hover=None;continue;}
             let mut cursor=POINT::default();let mut rect=RECT::default();
             if GetCursorPos(&mut cursor).is_err() || GetWindowRect(hwnd,&mut rect).is_err(){continue;}
+            if !down {
+                // 细条点穿后收不到鼠标移入事件，在它的可见区域内移动才唤醒绘制。
+                let pos=(cursor.x-rect.left,cursor.y-rect.top);
+                if last_hover.replace(pos)==Some(pos){continue;}
+                let mut bounds=RECT::default();
+                windows::Win32::Graphics::Gdi::GetWindowRgnBox(hwnd,&mut bounds);
+                if pos.0<bounds.left || pos.0>=bounds.right || pos.1<bounds.top || pos.1>=bounds.bottom {continue;}
+            }
             if cursor.x>=rect.left && cursor.x<rect.right && cursor.y>=rect.top && cursor.y<rect.bottom {ctx.request_repaint();}
         }
     });
@@ -427,6 +437,12 @@ impl ShapeAlpha {
 impl Window {
     pub fn hwnd(&self)->HWND {self.hwnd}
 
+    pub fn holding_through_strip(&self)->bool {
+        use windows::Win32::UI::Input::KeyboardAndMouse::VK_MBUTTON;
+        unsafe {GetWindowLongPtrW(self.hwnd,GWL_EXSTYLE) & WS_EX_TRANSPARENT.0 as isize != 0
+            && [VK_LBUTTON,VK_RBUTTON,VK_MBUTTON].iter().any(|key|GetAsyncKeyState(key.0 as i32)<0)}
+    }
+
     /// 顶栏重新置顶后恢复岛体层级；没有遮挡时不修改窗口顺序，也不激活窗口。
     pub fn keep_above_top_bar(&mut self,bounds:crate::display_layout::Bounds) {
         let display=match &self.layering {Layering::Active(layered)=>layered.display(),_=>self.hwnd};
@@ -589,6 +605,8 @@ impl Window {
             px(hit_rect.1 + hit_rect.3),
         );
         let mut hits=vec![h];
+        // 仍有画面但没有点击目标时，让系统直接把输入分派给下层进程。
+        let passive=r.2>r.0 && r.3>r.1 && h.2==h.0 && notice_hit.is_none() && !capture;
         if let Some((x,y,w,h))=notice_hit {hits.push((px(x),px(y),px(x+w),px(y+h)));}
         *hit().lock().unwrap_or_else(|e| e.into_inner()) = hits;
         // 毛玻璃：合成引擎的模糊块贴合岛体轮廓，窗口区域仍用矩形（含阴影与拖放感应区）。
@@ -596,7 +614,7 @@ impl Window {
         // 分层窗口显示的是带真实透明通道的画面时，系统模糊同样能透出来（模糊底板紧贴在岛仔窗口下方，
         // 分层显示窗口在上方）；只有轮廓裁剪或按轮廓补 alpha（内部不透明）时才关掉模糊。
         let layered_alpha=matches!(self.layering,Layering::Active(_)) && !self.outline.active;
-        match glass.filter(|g|!g.is_empty() && !self.blur_unavailable && (!self.opaque_surface || layered_alpha) && compositor_blur_allowed()) {
+        match glass.filter(|g|!passive && !g.is_empty() && !self.blur_unavailable && (!self.opaque_surface || layered_alpha) && compositor_blur_allowed()) {
             Some(shapes) => {
                 if self.backdrop.is_none() {
                     match crate::composition::Backdrop::new() {
@@ -666,6 +684,20 @@ impl Window {
         let raise=expanded && !self.expanded;
         unsafe { apply_style(self.hwnd, editing, raise) };
         if let Layering::Active(layered)=&mut self.layering {layered.sync(self.hwnd,raise);}
+        unsafe {
+            let ex=GetWindowLongPtrW(self.hwnd,GWL_EXSTYLE);
+            let transparent=WS_EX_TRANSPARENT.0 as isize;
+            let layered=WS_EX_LAYERED.0 as isize;
+            if passive && (ex & (transparent|layered)) != (transparent|layered) {
+                SetWindowLongPtrW(self.hwnd,GWL_EXSTYLE,ex|transparent|layered);
+                if !matches!(self.layering,Layering::Active(_)) {
+                    let _=SetLayeredWindowAttributes(self.hwnd,windows::Win32::Foundation::COLORREF(0),255,LWA_ALPHA);
+                }
+            } else if !passive && ex & transparent != 0 {
+                let remove=if matches!(self.layering,Layering::Active(_)){transparent}else{transparent|layered};
+                SetWindowLongPtrW(self.hwnd,GWL_EXSTYLE,ex & !remove);
+            }
+        }
         self.expanded = expanded;
     }
 }
@@ -935,6 +967,31 @@ mod tests {
             assert_eq!(SendMessageW(hwnd,WM_NCHITTEST,WPARAM(0),point(500,80)).0,HTTRANSPARENT as isize,"感应区中的普通点击仍须穿透");
             assert_eq!(SendMessageW(hwnd,WM_NCHITTEST,WPARAM(0),point(320,15)).0,HTCLIENT as isize,"岛体本身仍可交互");
             let _=DestroyWindow(hwnd);*hit().lock().unwrap_or_else(|e|e.into_inner())=saved;
+        }
+    }
+
+    #[test]
+    fn passive_strip_yields_native_hits_and_expanded_panel_takes_them_back(){
+        let _guard=NATIVE_STATE_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+        unsafe {
+            let create=||CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE|WS_EX_TOPMOST,windows::core::w!("BUTTON"),windows::core::w!(""),WS_POPUP|WS_VISIBLE,80,80,80,32,None,None,None,None).unwrap();
+            let tab=create();
+            let island=create();
+            let mut native=Window{hwnd:island,layering:Layering::Pending,region:(0,0,0,0),expanded:false,hook:HWINEVENTHOOK::default(),browser_state:(None,PollClock::now()),drag_capture:DragCapture::default(),glass:None,backdrop:None,blur:false,blur_unavailable:false,opaque_surface:false,outline:ShapeAlpha::default()};
+            let saved=hit().lock().unwrap_or_else(|e|e.into_inner()).clone();
+            let find=|x,y|std::thread::spawn(move||WindowFromPoint(POINT{x,y}).0 as usize).join().unwrap();
+            let region=(0.0,0.0,80.0,32.0);
+            native.update(region,(0.0,0.0,0.0,0.0),None,None,None,1.0,false,false);
+            let center=find(120,84);
+            let margin=find(130,96);
+            native.update(region,region,None,None,None,1.0,false,true);
+            let panel=find(120,84);
+            drop(native);
+            let _=DestroyWindow(island);
+            let _=DestroyWindow(tab);
+            *hit().lock().unwrap_or_else(|e|e.into_inner())=saved;
+            assert_eq!((center,margin),(tab.0 as usize,tab.0 as usize),"细条中心和透明留白都应命中下层窗口");
+            assert_eq!(panel,island.0 as usize,"展开后面板应恢复命中");
         }
     }
 

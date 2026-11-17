@@ -7390,10 +7390,12 @@ fn automatic_minimal_hides_unread_hit_area_until_reopened(){
         for _ in 0..90 {side_frame_with(&mut h,None);}
         let out=side_frame_with(&mut h,None);
         assert!(out.notice_hit.is_none(),"{dock:?} 避让时未读仍占用鼠标区域");
+        assert!(out.click_through,"{dock:?} 细条可感应悬停，点击应交给底下的程序");
         assert_eq!(h.app.pending_messengers.len(),2);
         h.app.show_page(0);
         for _ in 0..60 {side_frame_with(&mut h,None);}
-        assert!(side_frame_with(&mut h,None).notice_hit.is_some());
+        let opened=side_frame_with(&mut h,None);
+        assert!(opened.notice_hit.is_some() && !opened.click_through);
         h.browser_at_top=Some(false);
         for _ in 0..360 {side_frame_with(&mut h,None);}
         assert!(!h.app.open && side_frame_with(&mut h,None).notice_hit.is_some());

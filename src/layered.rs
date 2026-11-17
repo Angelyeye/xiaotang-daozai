@@ -140,10 +140,12 @@ fn create_display_window() -> windows::core::Result<HWND> {
 }
 
 /// 让岛仔窗口自身几乎不可见但仍可命中；winit 改样式时可能抹掉分层位，每帧兜底。
-unsafe fn hide_owner(owner: HWND) -> windows::core::Result<()> {
+unsafe fn hide_owner(owner: HWND, first_frame: bool) -> windows::core::Result<()> {
     let ex = GetWindowLongPtrW(owner, GWL_EXSTYLE);
     if ex & WS_EX_LAYERED.0 as isize == 0 {
         SetWindowLongPtrW(owner, GWL_EXSTYLE, ex | WS_EX_LAYERED.0 as isize);
+    }
+    if first_frame || ex & WS_EX_LAYERED.0 as isize == 0 {
         SetLayeredWindowAttributes(owner, COLORREF(0), OWNER_ALPHA, LWA_ALPHA)?;
     }
     Ok(())
@@ -239,7 +241,7 @@ impl Layered {
             let (src, dst_pos, sz) = (POINT::default(), POINT { x: rect.left, y: rect.top }, SIZE { cx: w, cy: h });
             UpdateLayeredWindow(self.display, None, Some(&dst_pos), Some(&sz), self.dc, Some(&src), COLORREF(0), Some(&blend), ULW_ALPHA)?;
             // 显示窗口有了内容之后才把岛仔窗口自身藏起来，避免切换瞬间什么都看不到。
-            hide_owner(owner)?;
+            hide_owner(owner, self.last.is_none())?;
         }
         self.last = Some(hash);
         self.sync(owner, false);
@@ -250,7 +252,7 @@ impl Layered {
     pub fn sync(&mut self, owner: HWND, raise: bool) {
         if self.last.is_none() { return; }
         unsafe {
-            let _ = hide_owner(owner);
+            let _ = hide_owner(owner, false);
             // 全屏隐藏只清空主窗口区域，仍需同步隐藏独立的显示层。
             let owner_visible = IsWindowVisible(owner).as_bool()
                 && GetWindowRgnBox(owner, &mut RECT::default()) != NULLREGION;
