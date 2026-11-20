@@ -2752,6 +2752,52 @@ fn hover_morph_keeps_interactive_frames_after_input_stops() {
 }
 
 #[test]
+fn collapse_readback_covers_the_returning_pet_then_goes_idle() {
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    let mut h=H::new();
+    h.app.set_pet(true);
+    h.hover(Pos2::new(WIN_W/2.0,12.0),1.5);
+    assert!(h.app.debug_state().1);
+    h.cursor=None;
+    for _ in 0..60 {
+        h.frame(vec![]);
+        if !h.app.debug_state().1 {break;}
+    }
+    assert!(!h.app.debug_state().1);
+    for _ in 0..36 {h.frame(vec![]);}
+    assert!(h.interactive_transition,"收起后宠物还在淡入，读回应保持交互节奏");
+    for _ in 0..90 {h.frame(vec![]);}
+    assert!(!h.interactive_transition,"宠物淡入结束后应恢复闲置节奏");
+}
+
+#[test]
+fn wheel_between_different_heights_keeps_the_unread_bubble_in_place() {
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    let mut h=H::new();
+    h.app.settings.visible_pages.fill(true);
+    h.app.settings.wechat_notifications=true;
+    h.app.receive_wechat_reminder();
+    h.app.alerts.clear();
+    h.app.notice=None;
+    h.app.show_page(crate::app::QUOTA_PAGE);
+    h.hover(Pos2::new(WIN_W/2.0,12.0),1.2);
+    h.hover(H::local(210.0,18.0),0.4);
+    let id=egui::Id::new(("card",true,"微信"));
+    let center=h.ctx.read_response(id).unwrap().rect.center();
+    let height=h.app.expanded_height();
+    for (delta,page) in [(-40.0,crate::app::CALENDAR_PAGE),(40.0,crate::app::QUOTA_PAGE)] {
+        h.wheel(delta);
+        assert_eq!(h.app.page,page);
+        if delta<0.0 {assert_ne!(h.app.expanded_height(),height);}
+        for _ in 0..60 {
+            let pos=h.ctx.read_response(id).unwrap().rect.center();
+            assert!(pos.distance(center)<0.1,"切页时消息气泡发生位移：{center:?} → {pos:?}");
+            h.frame(vec![]);
+        }
+    }
+}
+
+#[test]
 fn wheel_page_transition_keeps_interactive_frames_after_input_stops() {
     let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
     let mut h=H::new();
@@ -7999,6 +8045,39 @@ fn messenger_notifications_keep_separate_badges_until_the_client_is_viewed(){
     h.app.receive_wechat_reminder();h.app.receive_wechat_reminder();
     assert_eq!(sources(&h),[Messenger::Wechat]);
     h.app.settings.wechat_notifications=false;h.frame(vec![]);assert!(h.app.pending_messengers.is_empty());
+}
+
+#[test]
+fn unread_capsule_center_stays_put_as_the_island_springs_open() {
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    for dock in crate::model::Dock::ALL {
+        let mut h=H::new();
+        h.app.settings.dock=dock;
+        h.app.settings.wechat_notifications=true;
+        h.app.receive_wechat_reminder();
+        h.app.alerts.clear();
+        h.app.notice=None;
+        let win=Rect::from_min_size(Pos2::ZERO,Vec2::new(WIN_W,WIN_H));
+        h.cursor=Some(match dock {
+            crate::model::Dock::Top=>win.center_top()+Vec2::new(0.0,12.0),
+            crate::model::Dock::Left=>win.left_center()+Vec2::new(8.0,0.0),
+            crate::model::Dock::Right=>win.right_center()-Vec2::new(8.0,0.0),
+        });
+        let id=egui::Id::new(("card",true,"微信"));
+        let mut centers=Vec::new();
+        for _ in 0..90 {
+            h.frame(vec![]);
+            if let Some(button)=h.ctx.read_response(id) {
+                if h.app.open && button.rect.width()>crate::app::UNREAD_W-0.1 {
+                    centers.push(button.rect.center());
+                }
+            }
+        }
+        assert!(centers.len()>30,"{dock:?} 应采集到完整展开后的按钮");
+        let end=*centers.last().unwrap();
+        let drift=centers.iter().map(|p|p.distance(end)).fold(0.0_f32,f32::max);
+        assert!(drift<0.1,"{dock:?} 未读图标展开后又移动了 {drift:.2} 个逻辑像素");
+    }
 }
 
 #[test]

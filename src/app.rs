@@ -2229,7 +2229,10 @@ impl App {
         let shelf_scrolling=self.open && self.page==3 && self.shelf_tab==0 && !self.shelf.items.is_empty()
             && (self.shelf_scroll.target!=self.shelf_first as f32 || !self.shelf_scroll.settled(1.0)
                 || self.shelf_x.values().any(|s|!s.settled(68.0)));
-        let interactive_transition=resizing || page_transition || scrolling || shelf_scrolling;
+        let pet_fading=self.pet_a>0.001 && self.pet_a<0.999;
+        let resident_moving=!self.resident.settled();
+        let closing_tail=!self.open && (resident_moving || (!minimal_pill && pet_fading));
+        let interactive_transition=closing_tail || resizing || page_transition || scrolling || shelf_scrolling;
         let transitioning = interactive_transition || self.position_drag.is_some() || self.drag_glide.is_some() || !self.drag_lift.settled(1.0) || !self.drag_stretch.settled(1.0)
             || self.center_guide>0.002 || self.center_lock_a>0.002 || self.t-self.center_lock_at<CENTER_SWEEP
             || self.page_e() < 0.7
@@ -2238,8 +2241,7 @@ impl App {
             || self.leave_since.is_some()
             || (self.drag_a > 0.001 && self.drag_a < 0.999)
             || self.drag_hot
-            || (self.pet_a > 0.001 && self.pet_a < 0.999)
-            || !self.resident.settled()
+            || pet_fading || resident_moving
             || self.open && self.page==2 && (!self.water_ring.settled(1.0) || !self.sit_view_t.settled(1.0) || !self.sit_t.settled(1.0))
             || self.toast.is_some()
             || self.t < self.notification_bell_until && self.t-self.notification_bell_at < 0.95
@@ -2365,9 +2367,10 @@ impl App {
             let inset=self.unread_top_inset();
             let height=self.unread_capsule_height(full.height()-inset);
             let left=self.dock()==model::Dock::Right || self.dock()==model::Dock::Top && full.right()+UNREAD_GAP+UNREAD_W>bounds.right();
-            let width=UNREAD_W*appear;
-            let x=if left {panel.left()-UNREAD_GAP*appear-width}else{panel.right()+UNREAD_GAP*appear};
-            return Some(Rect::from_min_size(Pos2::new(x,panel.top()+inset),Vec2::new(width,height*appear)));
+            // 胶囊在展开后的中心原地显现，避免跟着岛体边缘越过终点再弹回来。
+            let cx=if left {full.left()-UNREAD_GAP-UNREAD_W/2.0}else{full.right()+UNREAD_GAP+UNREAD_W/2.0};
+            let center=Pos2::new(cx,full.top()+inset+height/2.0);
+            return Some(Rect::from_center_size(center,Vec2::new(UNREAD_W,height)*appear));
         }
         // 极简刘海：横幅照常弹出，收起后只留细线，未读不常挂在线条上；展开岛体时在面板旁出现。
         if self.effective_minimal(){return None;}
