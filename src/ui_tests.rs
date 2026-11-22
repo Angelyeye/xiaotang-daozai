@@ -9958,6 +9958,118 @@ fn banner_jump_chip_always_reports_a_result(){
 }
 
 #[test]
+fn done_card_reply_text_jumps_back_to_the_client(){
+    // 需求：完成卡上的回复正文区域本身就是「回到原会话」的入口，不用再去找按钮。
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    // 测试期拦截真实 Win32 跳转：cargo test 不能抢用户正在用的前台窗口。
+    crate::agent_jump::intercept(true);
+    let mut h=H::new();
+    h.app.settings.dsh_notifications=true;
+    h.app.settings.agent.content=2;
+    h.app.settings.agent.expanded=true;
+    h.app.settings.agent.dwell=15;
+    let settings=h.app.settings.clone();
+    let finished=h.app.agent_cards.receive(serde_json::json!({
+        "id":"done-jump","provider":"dsh","kind":"finished",
+        "data":{"text":"## 本轮完成\n- 这一块是回复正文，点它应该回到原会话","sessionId":"sess-1","cwd":"C:\\work"}
+    }),&settings).expect("完成事件应转成通知");
+    h.app.agent_finished(finished.0,finished.1);
+    let _=crate::agent_jump::take_feedback();
+    assert!(h.app.agent_cards.finished_jump().is_some(),"完成事件应解析出可跳转的会话目标");
+    for _ in 0..60 {h.frame(vec![]);}
+    assert!(h.app.notice.is_some(),"应先弹出完成卡");
+    assert!(h.app.jump_note_text().is_none(),"还没点就不该有跳转结论");
+    let reply=h.strings().into_iter().find(|t|t.contains("回复正文")).expect("完成卡应显示回复摘要");
+    h.click_text(&reply);
+    for _ in 0..10 {h.frame(vec![]);}
+    let note=h.app.jump_note_text().unwrap_or_else(||panic!("点回复正文必须产生跳转结论，不能是死区域"));
+    assert!(note.contains("DeepSeek Harness")||note.contains("客户端"),"跳转结论要说明目标：{note}");
+    crate::agent_jump::intercept(false);
+}
+
+#[test]
+fn done_card_status_only_hint_is_not_a_jump_target(){
+    // 没有正文时那一行是「仅状态 · 未接收回复正文」的说明，不能伪装成可跳转的回复。
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    crate::agent_jump::intercept(true);
+    let mut h=H::new();
+    h.app.settings.dsh_notifications=true;
+    h.app.settings.agent.content=0;
+    h.app.settings.agent.expanded=true;
+    let settings=h.app.settings.clone();
+    let finished=h.app.agent_cards.receive(serde_json::json!({
+        "id":"done-no-body","provider":"dsh","kind":"finished",
+        "data":{"text":"","sessionId":"sess-2","cwd":"C:\\work"}
+    }),&settings).expect("完成事件应转成通知");
+    h.app.agent_finished(finished.0,finished.1);
+    for _ in 0..60 {h.frame(vec![]);}
+    assert!(h.app.jump_note_text().is_none(),"还没点就不该有跳转结论");
+    h.click_text("仅状态 · 未接收回复正文");
+    for _ in 0..10 {h.frame(vec![]);}
+    assert!(h.app.jump_note_text().is_none(),"仅状态说明行不该触发跳转");
+    crate::agent_jump::intercept(false);
+}
+
+#[test]
+fn agent_badge_stays_after_completion_bubble_and_clears_when_opened(){
+    // 需求：完成通知冒泡消失后，岛体侧边要像喝水/久坐一样常驻一个 Agent 角标；
+    // 点它本身（或点「查看回复」）后角标才消失。
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    crate::agent_jump::intercept(true);
+    let mut h=H::new();
+    h.app.settings.dsh_notifications=true;
+    h.app.settings.agent.content=2;
+    h.app.settings.agent.expanded=true;
+    h.app.settings.agent.dwell=2;
+    let settings=h.app.settings.clone();
+    let finished=h.app.agent_cards.receive(serde_json::json!({
+        "id":"badge-done","provider":"dsh","kind":"finished",
+        "data":{"text":"## 完成\n- 常驻角标验证","sessionId":"sess-badge","cwd":"C:\\work"}
+    }),&settings).expect("完成事件应转成通知");
+    h.app.agent_finished(finished.0,finished.1);
+    // 先让冒泡自然过期（dwell=2s），期间不点任何东西。
+    for _ in 0..200 {h.frame(vec![]);}
+    assert!(h.app.notice.is_none(),"完成卡冒泡应按时消失");
+    let badges=h.app.agent_badges();
+    assert_eq!(badges.len(),1,"冒泡消失后必须留下常驻角标");
+    assert_eq!(badges[0].kind,crate::agent_cards::BadgeKind::Done);
+    // 点角标：跳到原会话并清掉这条提醒。
+    let badge=badges[0].clone();
+    h.app.open_agent_badge(&badge);
+    assert!(h.app.agent_badges().is_empty(),"点过角标后提醒应消失");
+    assert!(h.app.toast_text().is_some(),"跳转必须给出可见结论（角标场景用岛体下方短提示）");
+    // 客户端本来就在最前台时切窗口没有可见变化：必须退化成在岛上打开结果层，
+    // 否则用户点角标看到的就是「什么都没发生」。
+    assert!(h.app.result_active(),"已在前台时点角标应直接在岛上打开本轮回复");
+    for _ in 0..40 {h.frame(vec![]);}
+    assert!(h.strings().iter().any(|t|t.contains("本轮回复")),"结果层要能直接看到正文");
+    crate::agent_jump::intercept(false);
+}
+
+#[test]
+fn pending_approval_keeps_a_blocking_card_instead_of_a_badge(){
+    // 待审批走的是常驻提示卡（duration=∞），不会被别的通知顶掉，所以不需要再叠角标；
+    // 这里锁定这个分工：请求在队列里 → 卡片在、角标不重复占位。
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    let mut h=H::new();
+    h.app.settings.dsh_notifications=true;
+    h.app.settings.agent.interactive=true;
+    let settings=h.app.settings.clone();
+    h.app.agent_cards.receive(serde_json::json!({"id":"badge-approval","provider":"dsh","kind":"approval",
+        "data":{"tool":"bash","cwd":"C:\\work","operation":"{\"cmd\":\"ls\"}"}}),&settings);
+    for _ in 0..20 {h.frame(vec![]);}
+    assert_eq!(h.app.agent_cards.badges().len(),1,"底层应登记这条待办");
+    assert!(h.app.agent_badges().is_empty(),"卡片正在显示时不该再叠角标");
+    // 切页不能把待审批卡片带走（之前点岛体切页会把提示卡一起清掉，用户以为没事了）。
+    h.app.show_page(1);
+    for _ in 0..10 {h.frame(vec![]);}
+    assert!(h.app.notice.is_some(),"切页后待审批卡片必须还在");
+    assert_eq!(h.app.agent_cards.count(),1);
+    h.app.agent_cards.hand_back("badge-approval");
+    assert!(h.app.agent_badges().is_empty());
+}
+
+#[test]
 fn result_layer_scroll_persists_and_never_flips_the_island_page(){
     // 回归：结果层滚动偏移以前只存在局部变量里，每帧从 0 重新开始（长回复滚不动）；
     // 同时滚轮会被「滚轮翻页」逻辑吞掉，滚一下就翻到下一张岛页。

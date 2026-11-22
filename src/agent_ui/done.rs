@@ -97,13 +97,30 @@ pub(crate) fn draw_done(c: &Card, m: &M, v: &DoneView, t: f64) -> Option<Action>
         let title = m.fit(v.kicker, 11.5, W::Semibold, 120.0);
         crate::extras::agent_icon(&c, 20.0, h / 2.0, 22.0, v.provider);
         galley(&c, 40.0, 7.0, &title, theme::WHITE);
+        // 正文摘要区域可点击回到原会话（有正文且有跳转目标时）：悬停提亮 + 手型光标。
+        let mut body_hit = None;
+        let mut body_hover = 0.0;
         if detail {
+            if v.jump {
+                let r = c.hit(40.0, 21.0, (w - 96.0 - 40.0).max(40.0), 18.0, "agent-done-body");
+                let (hover, _) = c.hover_t(&r);
+                body_hover = hover;
+                crate::ui_map::node("body.reply", c.rect(40.0, 21.0, (w - 96.0 - 40.0).max(40.0), 18.0), "回复摘要（点击回到会话）", true);
+                body_hit = Some(r);
+                if hover > 0.01 {
+                    c.fill(36.0, 20.0, (w - 96.0 - 40.0).max(40.0) + 8.0, 20.0, 5.0, Color32::from_white_alpha((10.0 * hover) as u8));
+                    c.ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+            }
             let body = m.fit(&preview_text(v.text, 60), 10.0, W::Regular, 150.0);
-            galley(&c, 40.0, 24.0, &body, theme::AGENT_MUTED);
+            galley(&c, 40.0, 24.0, &body, crate::paint::mix(theme::AGENT_MUTED, theme::WHITE, body_hover));
         } else {
             // 没有正文时在摘要位说明原因，不让用户以为「查看」按钮丢了。
             let body = m.fit(NO_BODY_HINT, 10.0, W::Regular, 150.0);
             galley(&c, 40.0, 24.0, &body, theme::AGENT_SUBTLE);
+        }
+        if body_hit.as_ref().is_some_and(|r| r.clicked()) {
+            action = Some(Action::Jump);
         }
         if detail
             && widgets::chip(&c, w - 96.0, (h - 22.0) / 2.0, 40.0, 22.0, "agent-result-open", "查看", theme::AGENT_OK)
@@ -136,7 +153,41 @@ pub(crate) fn draw_done(c: &Card, m: &M, v: &DoneView, t: f64) -> Option<Action>
     } else {
         m.text(NO_BODY_HINT, m::META, W::Regular, CONTENT_W)
     };
-    galley(&c, PAD, body_top, &line, if detail { theme::AGENT_MUTED } else { theme::AGENT_SUBTLE });
+    // 摘要区域可点击回到原会话（有正文且有跳转目标时）：悬停提亮 + 手型光标。
+    // 空行说明（无正文）不挂跳转，避免用户把「仅状态」误当成回复正文。
+    let reply_h = c.galley_h(&line).max(16.0);
+    let mut reply_hit = None;
+    let mut reply_hover = 0.0;
+    if detail && v.jump {
+        let r = c.hit(PAD - 4.0, body_top - 3.0, CONTENT_W + 8.0, reply_h + 6.0, "agent-done-body");
+        let (hover, _) = c.hover_t(&r);
+        reply_hover = hover;
+        crate::ui_map::node(
+            "body.reply",
+            c.rect(PAD - 4.0, body_top - 3.0, CONTENT_W + 8.0, reply_h + 6.0),
+            "回复摘要（点击回到会话）",
+            true,
+        );
+        reply_hit = Some(r);
+        if hover > 0.01 {
+            c.fill(PAD - 6.0, body_top - 4.0, CONTENT_W + 12.0, reply_h + 8.0, 5.0, Color32::from_white_alpha((12.0 * hover) as u8));
+            c.ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+    }
+    galley(
+        &c,
+        PAD,
+        body_top,
+        &line,
+        if detail {
+            crate::paint::mix(theme::AGENT_MUTED, theme::WHITE, reply_hover)
+        } else {
+            theme::AGENT_SUBTLE
+        },
+    );
+    if reply_hit.as_ref().is_some_and(|r| r.clicked()) {
+        action = Some(Action::Jump);
+    }
     let fy = (h - 14.0 - BTN_H).max(body_top + c.galley_h(&line) + 6.0);
     let specs = [("agent-result-open", "查看回复", true), ("agent-done-close", "关闭", false)];
     if let Some(i) = widgets::draw_footer(&c, fy, w, &specs, true) {

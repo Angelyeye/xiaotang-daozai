@@ -87,16 +87,29 @@ fn write_changed(path: &Path, bytes: &[u8]) -> io::Result<()> {
     crate::model::atomic_write(path, bytes)
 }
 
+/// DSH 前端导航模块的源码：把占位符替换成这一次的 loopback endpoint。
+///
+/// 端口/token 每次启动可能不同，所以不能把 endpoint 写死在仓库文件里；导出的 kit 才是
+/// profile 真正加载的那份，注入发生在这里。没有导航通道时保留占位符，客户端插件会静默跳过。
+fn navigation_client_source(endpoint: Option<&str>) -> String {
+    include_str!("../integrations/agent-notices/bridge/navigation-client.js")
+        .replace("__DAOZAI_NAV_ENDPOINT__", endpoint.unwrap_or("__DAOZAI_NAV_ENDPOINT__"))
+}
+
 pub fn export(dir: &Path, executable: &Path) -> io::Result<()> {
     fs::create_dir_all(dir.join("bridge"))?;
+    // DSH 前端插件用它来精确切会话；port/token 每次启动可能不同，所以导出时替换占位符。
+    let navigation = crate::agent_jump::navigation_endpoint();
+    let navigation_client = navigation_client_source(navigation.as_deref());
     for (name, data) in [
-        ("README.md", include_str!("../docs/AGENT-NOTICES.md")),
-        ("connect.mjs", include_str!("../integrations/agent-notices/connect.mjs")),
-        ("bridge/index.mjs", include_str!("../integrations/agent-notices/bridge/index.mjs")),
-        ("bridge/channel.cjs", include_str!("../integrations/agent-notices/bridge/channel.cjs")),
-        ("bridge/notify.cjs", include_str!("../integrations/agent-notices/bridge/notify.cjs")),
-        ("bridge/cordis.patch.yml", include_str!("../integrations/agent-notices/bridge/cordis.patch.yml")),
-        ("bridge/package.json", include_str!("../integrations/agent-notices/bridge/package.json")),
+        ("README.md", include_str!("../docs/AGENT-NOTICES.md").to_owned()),
+        ("connect.mjs", include_str!("../integrations/agent-notices/connect.mjs").to_owned()),
+        ("bridge/index.mjs", include_str!("../integrations/agent-notices/bridge/index.mjs").to_owned()),
+        ("bridge/channel.cjs", include_str!("../integrations/agent-notices/bridge/channel.cjs").to_owned()),
+        ("bridge/notify.cjs", include_str!("../integrations/agent-notices/bridge/notify.cjs").to_owned()),
+        ("bridge/navigation-client.js", navigation_client),
+        ("bridge/cordis.patch.yml", include_str!("../integrations/agent-notices/bridge/cordis.patch.yml").to_owned()),
+        ("bridge/package.json", include_str!("../integrations/agent-notices/bridge/package.json").to_owned()),
     ] {
         write_changed(&dir.join(name), data.as_bytes())?;
     }

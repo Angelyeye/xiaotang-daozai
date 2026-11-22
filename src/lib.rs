@@ -18,6 +18,7 @@ pub mod agent_notice;
 pub mod agent_cards;
 mod agent_ui;
 pub mod agent_jump;
+pub mod dsh_nav;
 pub mod messenger;
 pub mod child_process;
 mod settings_window;

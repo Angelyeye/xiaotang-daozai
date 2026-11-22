@@ -24,6 +24,7 @@
 
 use eframe::egui;
 use serde_json::{json, Value};
+#[cfg(test)]
 use std::cell::RefCell;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};

@@ -4,13 +4,12 @@
 > 本文是复盘 + 已落地改动 + 下一步建议，供后续迭代直接照做。
 
 ## 1. 一轮迭代的真实成本（本轮实测）
-
 | 环节 | 一次耗时 | 占一轮比例 | 备注 |
 |---|---|---|---|
 | `cargo build --release`（LTO） | **229s** | ~35% | `dev-cycle -Step Build` 实测 21:00→21:04 |
 | `cargo test --lib ui_tests` | **176s** | ~27% | 440 用例，串行 |
 | `cargo test --lib` 全量 | ~280s | — | 只在交付前跑 |
-| 真机 E2E（旧 OCR 脚本） | **96~140s** | ~20% | 单次 OCR 子进程 1.78s × 20~80 次 |
+| 真机 E2E（旧 OCR 脚本） | **96~140s** → 常驻 OCR 后 **62s** | ~20% | 单次 OCR 1.9s → 0.1s（见 §2.1） |
 | 交付核对（停进程/启动/比哈希） | 1~2 分钟人工 | ~8% | 易漏、exe 被占用会直接构建失败 |
 | 环境坑排查（BOM/锁屏/设置被静默回落） | **每次 10~30 分钟** | 不确定 | 本轮踩了 3 次 |
 
@@ -27,6 +26,53 @@
 | `Preferences` 容错解析 | `dwell=300` 这类超范围值不再让整条 agent 配置静默回落到默认值（本轮实际踩到，浪费 ~20 分钟） |
 | 锁屏检测（`LogonUI`） | 避免把"锁屏"误判成"卡片没弹出来" |
 | `AGENTS.md` 里的过期机器说明清理 | 交付路径不再误导 |
+| **OCR 常驻化**（`agent-screen-ocr-serve.ps1` + e2e 接入） | 单次识别 1.9s → **90~120ms**（见 §2.1） |
+| **事件驱动等待**（屏幕指纹 + 窗口/状态轮询替代固定 sleep） | E2E 固定等待 13 处 → 只留探针间隔；`-Scenario all` 62s → **52.7s**（见 §2.2） |
+| **Codex 来源补齐** | `codex-approval` 场景进 E2E（直连 Codex hook 通道，7.8s 通过）；见 §2.3 |
+| **完整性标签兜底**（`dev-cycle` Build 步骤） | 工作区被沙箱打 Low 标签时自动纠正 exe，避免「进程在但没有任何写入」（见 `2026-11-21-boot-freeze-root-cause.md`） |
+
+### 2.1 OCR 常驻化实测
+
+| 用法 | 单次耗时 |
+|---|---|
+| 旧：每次起 `powershell -File agent-screen-ocr.ps1` | **1.78~1.90s** |
+| 新：常驻服务首请求（含 ready 后第一次） | 0.35s |
+| 新：常驻服务后续请求 | **0.08~0.12s** |
+| 服务启动（一次性，`ready` 就绪） | ~1.26s |
+
+接口：`scripts/agent-screen-ocr-serve.ps1` 按行收发 JSON（`{"id":1,"region":[...],"scales":[...],"find":"允许"}` →
+同结构结果），保留 `-Once` 自检模式；`scripts/agent-e2e.ps1` 的 `Invoke-Ocr`/`Invoke-OcrScan` 优先走服务，
+服务起不来或中途崩溃时自动回退旧的子进程调用（行为不变）。
+
+### 2.2 事件驱动等待（替代固定 sleep）
+
+以前点完按钮固定睡 500~900ms、场景之间睡 800ms，是纯猜时间。现在：
+
+| 原来 | 现在 |
+|---|---|
+| `Click-Point` 后固定 `sleep 500ms` | 点前等画面稳定；点后等「画面确实变了」（GDI `BitBlt` + 缩略灰度指纹，~10~30ms/次），命中即走（实测 **14ms** 就检测到响应） |
+| 场景切换 `sleep 800ms` | 等「画面回到收起态基线」或「画面连续 3 帧稳定」，实测 **151~392ms** |
+| 点「查看并审批 / 查看回复 / 下一题」后 `sleep 700~900ms` | 直接 `Wait-Text` 等目标文字出现（本身就是事件驱动） |
+| 轮询间隔 200~250ms | 探针轮询降到 60~80ms（等待更及时，总时长更短） |
+
+真机结果：`-Scenario all`（approval/question/done）**52.7s**；逐场景 13.1s / 19.5s / 13.5s。
+加速上限已经不在「等」，而在 DSH 驱动冷启动与会话往返（每场景 ~5~8s），下一步要动的是复用宿主进程。
+
+### 2.3 Codex 来源修复
+
+现象：岛仔「Codex」来源一直不可用（设置里从未打开，`~/.codex/hooks.json` 里也没有 Daozai hooks）。
+
+已修：
+
+1. `~/.codex/hooks.json` 写入 Daozai 的 `Stop` / `PermissionRequest` / `PreToolUse^request_user_input$` 三组 hooks
+   （走 `connect.mjs codex install`，与岛仔设置里打开开关时执行的完全一致；安装前已备份原文件）；
+2. 岛仔 `settings.txt` 的 `codex_notifications=1`，重启后 `live.json` 的 `policy.codex=true`；
+3. E2E 新增 `-Scenario codex-approval`：完全按 Codex 的 hook 契约喂 stdin 事件，
+   在岛上点「仅允许这一次」，校验 hook 输出 `{"hookSpecificOutput":{...,"decision":{"behavior":"allow"}}}` —— 真机 **7.8s 通过**。
+
+仍需用户侧一步（客户端机制，无法代替）：Codex 客户端重启后**查看并信任 Daozai hooks**（`~/.codex/.hook-trust` 里目前只有旧记录）；
+Codex 对 `request_user_input` 只做提示、作答仍在 Codex 内，这是集成设计如此。
+
 
 ## 3. 本轮踩到的坑（都建议变成防护）
 

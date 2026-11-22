@@ -42,6 +42,8 @@ pub(crate) struct Alert {
     pub bluetooth: Option<(crate::bt::DeviceKind, bool)>,
     pub meeting: Option<(crate::mail::Meeting, String)>,
     pub unread: Option<crate::app::Unread>,
+    /// 完成卡正文点击时要跳回去的客户端会话；其它通知为 None。
+    pub agent_jump: Option<crate::agent_jump::Target>,
 }
 impl Alert {
     pub(crate) fn agent_provider(&self)->Option<crate::agent_notice::Provider>{match self.source{
@@ -267,6 +269,7 @@ impl App {
             bluetooth: None,
             meeting: None,
             unread: None,
+            agent_jump: None,
         };
         self.enqueue_alert(a, system);
     }
@@ -274,7 +277,7 @@ impl App {
         self.enqueue_alert(Alert {
             source: AlertSource::Internal,
             title: "会议提醒".into(), body: format!("{} · {} · {}", meeting.title, meeting.at, source),
-            page, at: self.t, duration: 12.0, bluetooth: None, meeting: Some((meeting, source)), unread: None,
+            page, at: self.t, duration: 12.0, bluetooth: None, meeting: Some((meeting, source)), unread: None, agent_jump: None,
         }, true);
     }
     pub(crate) fn bluetooth_alert(&mut self, device: &crate::bt::Device, connected: bool) {
@@ -291,6 +294,7 @@ impl App {
             bluetooth: Some((device.kind, connected)),
             meeting: None,
             unread: None,
+            agent_jump: None,
         };
         self.enqueue_alert(a, false);
     }
@@ -384,7 +388,7 @@ impl App {
         self.mark_messenger(client,unread.pid,unread.window);
         if pending{return;}
         self.notification_bell_at=self.t;self.notification_bell_until=self.t+4.5;
-        self.enqueue_alert(Alert{source:AlertSource::Messenger(client),title:client.name().into(),body:format!("有新消息 · 请到{}查看",client.name()),page:usize::MAX,at:self.t,duration:4.5,bluetooth:None,meeting:None,unread:Some(unread)},false);
+        self.enqueue_alert(Alert{source:AlertSource::Messenger(client),title:client.name().into(),body:format!("有新消息 · 请到{}查看",client.name()),page:usize::MAX,at:self.t,duration:4.5,bluetooth:None,meeting:None,unread:Some(unread),agent_jump:None},false);
     }
     pub fn set_messenger_status(&mut self,client:crate::app::Messenger,status:String){self.messenger_statuses.insert(client,status);}
     pub fn messenger_status(&self,client:crate::app::Messenger)->&str{self.messenger_statuses.get(&client).map(String::as_str).unwrap_or("")}
@@ -409,7 +413,7 @@ impl App {
             if let Some(code)=crate::otp::extract("",&text,&[]) {text=crate::mail_privacy::mask(&text,&code.text);}
             text
         }else{"收到新通知 · 内容已隐藏".into()};
-        self.enqueue_alert(Alert{source:AlertSource::External(id),title,body,page:usize::MAX,at:self.t,duration:4.5,bluetooth:None,meeting:None,unread},false);
+        self.enqueue_alert(Alert{source:AlertSource::External(id),title,body,page:usize::MAX,at:self.t,duration:4.5,bluetooth:None,meeting:None,unread,agent_jump:None},false);
     }
     pub fn receive_agent_notice(&mut self, crate::agent_notice::Notice(provider,status):crate::agent_notice::Notice) {
         if !provider.enabled(&self.settings) {return;}
@@ -418,7 +422,7 @@ impl App {
         self.notification_bell_at=self.t;
         self.notification_bell_until=self.t+4.5;
         self.enqueue_alert(Alert{source:AlertSource::Agent(provider),title:provider.label().into(),
-            body:status.label().into(),page:usize::MAX,at:self.t,duration:4.5,bluetooth:None,meeting:None,unread:None},false);
+            body:status.label().into(),page:usize::MAX,at:self.t,duration:4.5,bluetooth:None,meeting:None,unread:None,agent_jump:None},false);
     }
     pub fn agent_finished(&mut self,provider:crate::agent_notice::Provider,body:String) {
         if !provider.enabled(&self.settings){return;}
@@ -428,14 +432,18 @@ impl App {
             self.pending.push(Cmd::Notify(provider.label().into(),"本轮已结束".into(),if self.settings.sound{NotificationSound::System}else{NotificationSound::Silent}));
         }
         let body=if body.is_empty()||self.settings.agent.content==0{crate::agent_notice::Status::Finished.label().to_owned()}else{body};
+        // 完成卡正文可点击跳回原会话：目标由 agent_cards 在收到 finished 事件时解析好（含 session/cwd）。
+        let agent_jump=self.agent_cards.finished_jump();
+        // 客户端已经在前台时切窗口没有可见变化：留一份正文，点角标可直接在岛上打开结果层。
+        self.last_done_body=body.clone();
         self.enqueue_alert(Alert{source:AlertSource::AgentDone(provider),title:provider.label().into(),body,
-            page:usize::MAX,at:self.t,duration:self.settings.agent.dwell as f64,bluetooth:None,meeting:None,unread:None},false);
+            page:usize::MAX,at:self.t,duration:self.settings.agent.dwell as f64,bluetooth:None,meeting:None,unread:None,agent_jump},false);
     }
     pub fn reveal_messenger_notice(&mut self,unread:crate::app::Unread){
         if !unread.source.adapter().dismiss_unread || !self.pending_messengers.contains(&unread){return;}
         let body=if unread.pid==0{"消息账号暂无法确认"}else{"暂时无法打开对应窗口"};
         let source=if unread.source.adapter().capture==crate::messenger::Capture::Taskbar{AlertSource::Messenger(unread.source)}else{AlertSource::External(unread.source.adapter().notification_id.into())};
-        self.notice=Some(Alert{source,title:unread.source.name().into(),body:body.into(),page:usize::MAX,at:self.t,duration:4.5,bluetooth:None,meeting:None,unread:Some(unread)});
+        self.notice=Some(Alert{source,title:unread.source.name().into(),body:body.into(),page:usize::MAX,at:self.t,duration:4.5,bluetooth:None,meeting:None,unread:Some(unread),agent_jump:None});
         self.notification_bell_at=self.t;self.notification_bell_until=self.t+4.5;
     }
     pub(crate) fn tick_alerts(&mut self) {
@@ -482,7 +490,7 @@ impl App {
             if !self.notice.as_ref().is_some_and(|a|matches!(&a.source,AlertSource::AgentCard(_,current) if current==&id)){
                 if let Some(mut prev)=self.notice.take(){prev.duration=(prev.duration-(self.t-prev.at)).max(0.0);self.alerts.push_front(prev);}
                 self.notice=Some(Alert{source:AlertSource::AgentCard(p,id.clone()),title:title.clone(),body:summary,page:usize::MAX,
-                    at:self.t,duration:f64::INFINITY,bluetooth:None,meeting:None,unread:None});
+                    at:self.t,duration:f64::INFINITY,bluetooth:None,meeting:None,unread:None,agent_jump:None});
                 self.agent_setup.received(p);
                 if title=="需要你回答" {
                     // 提问是阻塞式请求：到达后直接展开答题面板，跳过中间提示卡。
@@ -581,6 +589,7 @@ impl App {
                 text:a.body.as_str(),
                 compact:!self.settings.agent.expanded,
                 age:(self.t-a.at) as f32,
+                jump:a.agent_jump.is_some(),
             };
             match crate::agent_ui::draw_done(&nc,&m,&view,self.t) {
                 Some(crate::agent_ui::Action::ShowResult)=>{
@@ -590,9 +599,22 @@ impl App {
                     } else {
                         self.agent_cards.open_result_no_body(p);
                     }
+                    // 用户已经看过这条完成通知：侧边常驻角标随之撤掉。
+                    self.agent_cards.done_seen();
                     self.open_agent_panel();
                 }
-                Some(crate::agent_ui::Action::Dismiss)=>{self.notice=None;}
+                Some(crate::agent_ui::Action::Jump)=>{
+                    // 点正文摘要直接回到原会话窗口（与详情卡右上角跳转同义）。
+                    // 失败时把原因常驻在岛体下方，不做静默失败。
+                    let Some(target)=a.agent_jump.as_ref() else{
+                        self.say("没有可跳回的会话：请回到客户端查看本轮结果");
+                        return;
+                    };
+                    let outcome=crate::agent_jump::open(target);
+                    self.jump_feedback(outcome.message());
+                    self.agent_cards.done_seen();
+                }
+                Some(crate::agent_ui::Action::Dismiss)=>{self.agent_cards.done_seen();self.notice=None;}
                 _=>{}
             }
             return;

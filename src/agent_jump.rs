@@ -20,6 +20,9 @@ use std::sync::Mutex;
 pub enum Target {
     /// Codex 线程深链，交给系统协议处理器打开。
     DeepLink(String),
+    /// DSH 会话精确导航：走本机 token 队列，由 DSH 前端插件调用 `uiWorkspace.openSession`。
+    /// 系统层没有这种深链，必须借助插件——见 `crate::dsh_nav`。
+    Session { provider: Provider, session_id: String },
     /// 把客户端主窗口带到前台；找不到窗口时用客户端自己的协议唤起，仍失败就如实报错。
     Client { name: &'static str, cwd: String },
     /// 打开工作目录。
@@ -33,6 +36,7 @@ impl Target {
     pub fn action_label(&self) -> &'static str {
         match self {
             Self::DeepLink(_) => "回到会话",
+            Self::Session { .. } => "回到会话",
             Self::Client { .. } => "切换到客户端",
             Self::Workspace(_) => "打开工作目录",
             Self::Unavailable(_) => "无可用跳转",
@@ -58,12 +62,28 @@ pub enum JumpOutcome {
     ProtocolRequested { client: String },
     /// 深链/目录这类由系统打开成功。
     Opened { note: String },
+    /// DSH 插件已把客户端切到指定会话（精确导航，不是只把窗口带前台）。
+    /// `window` 记录窗口本身被怎么处理：插件只切页面视图，最小化的窗口不会自己还原。
+    Navigated { client: String, window: WindowState },
     /// 找不到客户端窗口，也没有可兜底的目录。
     NoWindow { client: String },
     /// 找到了窗口但系统拒绝切到前台。
     Failed { client: String, reason: String },
     /// 目标本身没有可用的跳转信息。
     Unavailable(String),
+}
+
+/// 精确导航后客户端窗口的处理结果。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowState {
+    /// 窗口本来就在最前台。
+    Front,
+    /// 从最小化恢复。
+    Restored,
+    /// 从后台切到前台。
+    Focused,
+    /// 会话切过去了，但窗口没能带到前台（被前台锁挡住/找不到窗口）。
+    Hidden,
 }
 
 impl JumpOutcome {
@@ -75,6 +95,12 @@ impl JumpOutcome {
             Self::Focused { client } => format!("已切到 {client}"),
             Self::ProtocolRequested { client } => format!("已请求 {client} 回到前台（dsh://open）"),
             Self::Opened { note } => note.clone(),
+            Self::Navigated { client, window } => match window {
+                WindowState::Front => format!("已在 {client} 打开该会话"),
+                WindowState::Restored => format!("已恢复 {client} 并打开该会话"),
+                WindowState::Focused => format!("已切到 {client} 并打开该会话"),
+                WindowState::Hidden => format!("已打开 {client} 的该会话，但没能把窗口带到前台"),
+            },
             Self::NoWindow { client } => format!("没找到 {client} 的窗口，可能已退出或最小化到托盘"),
             Self::Failed { client, reason } => format!("没能切到 {client}：{reason}"),
             Self::Unavailable(reason) => reason.clone(),
@@ -168,11 +194,35 @@ pub fn resolve(provider: Provider, session_id: &str, cwd: &str) -> Target {
         Provider::Codex if !session.is_empty() && session.chars().count() <= 128 => {
             Target::DeepLink(format!("codex://threads/{}", encode(session)))
         }
-        // DSH 没有定位具体会话的深链，只能把客户端带到前台（dsh://open 只负责置前）。
+        // DSH 没有系统级会话深链，但有官方插件面：由 DSH 前端插件调用 uiWorkspace.openSession
+        // 精确定位到那条会话（island-hud 用的也是这条通道）。
+        Provider::Dsh if !session.is_empty() && session.chars().count() <= 500 => Target::Session {
+            provider,
+            session_id: session.to_owned(),
+        },
         Provider::Dsh => Target::Client { name: "DeepSeek Harness", cwd: dir },
         Provider::Codex if !dir.is_empty() => Target::Workspace(dir),
         _ => Target::Unavailable("客户端没有提供会话或目录信息"),
     }
+}
+
+/// 全局导航句柄：`main` 启动时安装一次，`open` 里直接取用。
+static NAVIGATION: Mutex<Option<crate::dsh_nav::Navigation>> = Mutex::new(None);
+
+/// 安装（或在重启导航服务后替换）DSH 会话导航句柄。
+pub fn install_navigation(navigation: crate::dsh_nav::Navigation) {
+    if let Ok(mut slot) = NAVIGATION.lock() {
+        *slot = Some(navigation);
+    }
+}
+
+fn navigation() -> Option<crate::dsh_nav::Navigation> {
+    NAVIGATION.lock().ok().and_then(|slot| slot.clone())
+}
+
+/// 安装接入包时用：当前导航通道的 endpoint（没有起服务时返回 None）。
+pub fn navigation_endpoint() -> Option<String> {
+    navigation().map(|nav| nav.endpoint())
 }
 
 /// 测试期拦截真实跳转：单元/UI 测试不应抢用户正在用的前台窗口。
@@ -193,6 +243,7 @@ pub fn open(target: &Target) -> JumpOutcome {
         let client = match target {
             Target::Client { name, .. } => (*name).to_owned(),
             Target::DeepLink(_) => "客户端会话".to_owned(),
+            Target::Session { .. } => "客户端的指定会话".to_owned(),
             Target::Workspace(dir) => format!("工作目录 {dir}"),
             Target::Unavailable(reason) => (*reason).to_owned(),
         };
@@ -203,6 +254,7 @@ pub fn open(target: &Target) -> JumpOutcome {
             Ok(()) => JumpOutcome::Opened { note: "已打开会话深链".to_owned() },
             Err(reason) => JumpOutcome::Failed { client: "客户端会话".to_owned(), reason },
         },
+        Target::Session { provider, session_id } => open_session(*provider, session_id),
         Target::Client { name, .. } => open_client(name),
         Target::Workspace(dir) => match shell_open(dir) {
             Ok(()) => JumpOutcome::Opened { note: format!("已打开工作目录 {dir}") },
@@ -211,6 +263,34 @@ pub fn open(target: &Target) -> JumpOutcome {
         Target::Unavailable(reason) => JumpOutcome::Unavailable((*reason).to_owned()),
     };
     report(outcome)
+}
+
+/// 让 DSH 前端插件精确打开某条会话；插件没装/DSH 没重启时退化成「把客户端带到前台」。
+fn open_session(provider: Provider, session_id: &str) -> JumpOutcome {
+    let client = match provider {
+        Provider::Dsh => "DeepSeek Harness",
+        Provider::Codex => "Codex",
+    };
+    if let Some(nav) = navigation() {
+        let outcome = nav.request(session_id, std::time::Duration::from_millis(2500));
+        trace(|| format!("nav session={session_id} outcome={outcome:?}"));
+        if outcome.navigated() {
+            // 插件只切页面视图：DSH 最小化时窗口不会自己弹出来，必须再把窗口带到前台。
+            // 先切会话再前置，用户看到的第一眼就是目标会话，不会闪一下旧界面。
+            let window = match open_client(client) {
+                JumpOutcome::Restored { .. } => WindowState::Restored,
+                JumpOutcome::Focused { .. } => WindowState::Focused,
+                JumpOutcome::AlreadyFront { .. } => WindowState::Front,
+                // 窗口隐藏到托盘时靠 dsh://open 兜底：它会 restore + focus，只是结果异步确认。
+                JumpOutcome::ProtocolRequested { .. } => WindowState::Restored,
+                _ => WindowState::Hidden,
+            };
+            return JumpOutcome::Navigated { client: client.to_owned(), window };
+        }
+    }
+    // 插件通道不可用（没装/没重启/超时）：退回窗口前置，至少让客户端可见。
+    // 提示里会说明这是「切到客户端」而不是「打开了会话」，不冒充精确跳转。
+    open_client(client)
 }
 
 /// 记录一条用户可见反馈，供上层取走。
@@ -522,8 +602,33 @@ mod tests {
     }
 
     #[test]
-    fn dsh_targets_its_client_window(){
+    fn navigated_messages_explain_what_happened_to_the_window(){
+        // 插件只切页面视图；最小化时窗口不会自己弹出来，结论必须分别说清楚。
+        let cases = [
+            (WindowState::Front, "已在 DeepSeek Harness 打开该会话"),
+            (WindowState::Restored, "已恢复 DeepSeek Harness 并打开该会话"),
+            (WindowState::Focused, "已切到 DeepSeek Harness 并打开该会话"),
+            (WindowState::Hidden, "已打开 DeepSeek Harness 的该会话，但没能把窗口带到前台"),
+        ];
+        for (window, expected) in cases {
+            let outcome = JumpOutcome::Navigated { client: "DeepSeek Harness".to_owned(), window };
+            assert_eq!(outcome.message(), expected, "窗口状态 {window:?} 的结论必须准确");
+            assert!(outcome.ok(), "精确导航成功属于成功结果");
+        }
+    }
+
+    #[test]
+    fn dsh_session_becomes_exact_navigation_target(){
+        // DSH 没有系统深链，但插件能精确切会话：这里必须解析成 Session，而不是只切窗口。
         let target = resolve(Provider::Dsh, "session-1", "C:\\work");
+        assert_eq!(target, Target::Session { provider: Provider::Dsh, session_id: "session-1".to_owned() });
+        assert_eq!(target.action_label(), "回到会话");
+        assert!(target.available());
+    }
+
+    #[test]
+    fn dsh_without_session_still_targets_its_client_window(){
+        let target = resolve(Provider::Dsh, "", "C:\\work");
         assert_eq!(target, Target::Client { name: "DeepSeek Harness", cwd: "C:\\work".to_owned() });
         assert_eq!(target.action_label(), "切换到客户端");
     }

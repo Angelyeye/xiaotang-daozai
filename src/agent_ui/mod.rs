@@ -16,11 +16,12 @@ mod question;
 mod widgets;
 
 pub(crate) use approval::{draw_approval, measure_approval};
-pub(crate) use banner::{draw_banner, measure_banner, BannerView};
+pub(crate) use banner::{draw_banner, BannerView};
+#[cfg(test)]
+pub(crate) use banner::measure_banner;
 pub(crate) use done::{draw_done, draw_result, measure_done, measure_result};
-pub(crate) use metrics::{M as Measurer, BAR_H, BTN_H, CARD_W, CONTENT_W, PAD};
-pub(crate) use question::{draw_question, measure_question, QuestionResult};
-pub(crate) use widgets::hit_any;
+pub(crate) use metrics::{M as Measurer, CARD_W, PAD};
+pub(crate) use question::{draw_question, measure_question};
 
 use crate::model::Settings;
 use eframe::egui;
@@ -119,6 +120,8 @@ pub(crate) struct DoneView<'a> {
     pub text: &'a str,
     pub compact: bool,
     pub age: f32,
+    /// 有可跳转的客户端会话时，正文区域可点击回到原会话（与详情卡右上角的跳转同义）。
+    pub jump: bool,
 }
 
 /// 结果正文视图（完成通知的「查看回复」）。
@@ -327,7 +330,7 @@ mod tests {
         let (_, bh) = measure_banner(&m, &banner, CARD_W);
         assert!(bh > 0.0 && bh <= WIN_H);
         for compact in [true, false] {
-            let done = DoneView { provider: crate::agent_notice::Provider::Dsh, kicker: "本轮已结束", text: "摘要", compact, age: 1.0 };
+            let done = DoneView { provider: crate::agent_notice::Provider::Dsh, kicker: "本轮已结束", text: "摘要", compact, age: 1.0, jump: false };
             let (_, dh) = measure_done(&m, &done);
             assert!(dh > 0.0 && dh <= WIN_H);
         }

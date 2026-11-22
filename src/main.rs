@@ -144,6 +144,18 @@ impl Shell {
         diagnostics::boot_trace("Shell::new: 进入");
         diagnostics::graphics(cc);
         diagnostics::boot_trace("Shell::new: graphics 记录完成");
+        // 会话导航通道：只监听 127.0.0.1 的 token 队列，供 DSH 前端插件精确切换会话。
+        // 起不来不影响主功能，跳转自动退回「把客户端带到前台」。
+        if let Some(nav)=daozai::dsh_nav::start(Some(&daozai::model::config_dir())) {
+            daozai::agent_jump::install_navigation(nav);
+            // 已接入过 DSH 的用户：把这次的 endpoint 刷进 kit，插件下次加载就能用。
+            // （端口通常是固定值，写入是 no-op；端口或 token 变了才真正改写。）
+            if let Ok(exe)=std::env::current_exe() {
+                let kit=daozai::model::config_dir().join("agent-notices");
+                if kit.is_dir() { let _=daozai::agent_notice::export(&kit,&exe); }
+            }
+            diagnostics::boot_trace("Shell::new: 会话导航通道就绪");
+        }
         let running_compat=cc.wgpu_render_state.is_some();
         diagnostics::startup("加载本地配置");
         let mut app = App::new(&cc.egui_ctx, Options::default());

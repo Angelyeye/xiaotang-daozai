@@ -4,5 +4,17 @@
   "private": true,
   "type": "module",
   "main": "index.mjs",
-  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } }
+  "exports": {
+    ".": "./index.mjs",
+    "./client": "./navigation-client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": ["@deepseek-ai/dsh-client-ui-workspace"]
+    }
+  }
 }

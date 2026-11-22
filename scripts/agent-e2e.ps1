@@ -36,7 +36,7 @@
 [CmdletBinding()]
 param(
   [string]$Exe,
-  [ValidateSet('approval', 'question', 'question-multi', 'question-multi-turn', 'done', 'all')]
+  [ValidateSet('approval', 'question', 'question-multi', 'question-multi-turn', 'done', 'codex-approval', 'all')]
   [string]$Scenario = 'all',
   [string]$DataDir,
   [int]$WaitSeconds = 90,
@@ -133,6 +133,74 @@ public static class DaozaiE2EInput {
     return true;
   }
 }
+
+// 区域「指纹」：把一块屏幕按网格降采样成灰度值，用来判断界面有没有变化。
+// 单次抓图 + 采样在 10~30ms，比一次 OCR（~100ms）快一个数量级，适合做「点完等变化」的事件驱动等待，
+// 取代以前「点完固定 sleep 500~900ms」的做法。
+public static class DaozaiE2EScreen {
+  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
+  [DllImport("user32.dll")] public static extern IntPtr GetDC(IntPtr hwnd);
+  [DllImport("user32.dll")] public static extern int ReleaseDC(IntPtr hwnd, IntPtr dc);
+  [DllImport("gdi32.dll")] public static extern bool BitBlt(IntPtr dst, int x, int y, int w, int h, IntPtr src, int sx, int sy, uint rop);
+  [DllImport("gdi32.dll")] public static extern IntPtr CreateCompatibleDC(IntPtr dc);
+  [DllImport("gdi32.dll")] public static extern IntPtr CreateCompatibleBitmap(IntPtr dc, int w, int h);
+  [DllImport("gdi32.dll")] public static extern IntPtr SelectObject(IntPtr dc, IntPtr obj);
+  [DllImport("gdi32.dll")] public static extern bool DeleteObject(IntPtr obj);
+  [DllImport("gdi32.dll")] public static extern bool DeleteDC(IntPtr dc);
+  [DllImport("gdi32.dll")] public static extern int GetDIBits(IntPtr dc, IntPtr bmp, uint start, uint lines, byte[] bits, ref BITMAPINFO info, uint usage);
+  [StructLayout(LayoutKind.Sequential)] public struct BITMAPINFOHEADER {
+    public uint biSize; public int biWidth; public int biHeight; public ushort biPlanes; public ushort biBitCount;
+    public uint biCompression; public uint biSizeImage; public int biXPelsPerMeter; public int biYPelsPerMeter;
+    public uint biClrUsed; public uint biClrImportant;
+  }
+  [StructLayout(LayoutKind.Sequential)] public struct BITMAPINFO {
+    public BITMAPINFOHEADER bmiHeader; public uint bmiColors;
+  }
+  // 返回 cols*rows 个灰度值（0..255）；失败返回 null。
+  public static int[] Signature(int x, int y, int w, int h, int cols, int rows) {
+    if (w <= 0 || h <= 0) return null;
+    IntPtr screen = GetDC(IntPtr.Zero);
+    if (screen == IntPtr.Zero) return null;
+    IntPtr mem = CreateCompatibleDC(screen);
+    IntPtr bmp = CreateCompatibleBitmap(screen, w, h);
+    IntPtr old = SelectObject(mem, bmp);
+    try {
+      if (!BitBlt(mem, 0, 0, w, h, screen, x, y, 0x00CC0020)) return null; // SRCCOPY
+      var info = new BITMAPINFO();
+      info.bmiHeader.biSize = (uint)Marshal.SizeOf(typeof(BITMAPINFOHEADER));
+      info.bmiHeader.biWidth = w;
+      info.bmiHeader.biHeight = -h; // 负高度 = 自上而下
+      info.bmiHeader.biPlanes = 1;
+      info.bmiHeader.biBitCount = 32;
+      info.bmiHeader.biCompression = 0;
+      var bits = new byte[w * h * 4];
+      if (GetDIBits(mem, bmp, 0, (uint)h, bits, ref info, 0) == 0) return null;
+      var result = new int[cols * rows];
+      if (cols < 1) cols = 1; if (rows < 1) rows = 1;
+      for (int cy = 0; cy < rows; cy++) {
+        for (int cx = 0; cx < cols; cx++) {
+          int x0 = cx * w / cols, x1 = (cx + 1) * w / cols;
+          int y0 = cy * h / rows, y1 = (cy + 1) * h / rows;
+          long sum = 0; int n = 0;
+          for (int yy = y0; yy < y1; yy += 2) {
+            for (int xx = x0; xx < x1; xx += 2) {
+              int i = (yy * w + xx) * 4;
+              sum += (bits[i] * 29 + bits[i + 1] * 150 + bits[i + 2] * 77) >> 8;
+              n++;
+            }
+          }
+          result[cy * cols + cx] = n == 0 ? 0 : (int)(sum / n);
+        }
+      }
+      return result;
+    } finally {
+      SelectObject(mem, old);
+      DeleteObject(bmp);
+      DeleteDC(mem);
+      ReleaseDC(IntPtr.Zero, screen);
+    }
+  }
+}
 '@
 
 # ---------------------------------------------------------------- 前置检查
@@ -162,15 +230,95 @@ if ($logon.Count) {
     '锁屏时只能截到锁屏背景、点击也落不到岛上。请先解锁桌面再跑。')
 }
 
+# ---------------------------------------------------------------- 常驻 OCR 服务
+# 旧做法每次识别都起一个 powershell.exe 子进程：进程启动 + P/Invoke 编译 + WinRT/OCR 引擎初始化
+# 约 1.8~1.9 秒，而真正的识别只有 ~100ms；一次 E2E 要调几十次，绝大部分时间都花在这上面。
+# 这里起一个常驻服务（scripts/agent-screen-ocr-serve.ps1），初始化一次后按行收发 JSON，
+# 单次识别降到 ~100ms；服务起不来或中途崩掉时自动回退到旧的子进程调用，行为不变。
+$script:OcrService = $null
+
+function Start-OcrService {
+  if ($script:OcrService -and -not $script:OcrService.Process.HasExited) { return $true }
+  $serve = Join-Path $PSScriptRoot 'agent-screen-ocr-serve.ps1'
+  if (-not (Test-Path -LiteralPath $serve)) { return $false }
+  try {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = 'powershell.exe'
+    $psi.Arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $serve + '"'
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $true
+    $psi.StandardOutputEncoding = New-Object System.Text.UTF8Encoding($false)
+    $proc = New-Object System.Diagnostics.Process
+    $proc.StartInfo = $psi
+    [void]$proc.Start()
+    $deadline = (Get-Date).AddSeconds(20)
+    $ready = $null
+    while ((Get-Date) -lt $deadline) {
+      $line = $proc.StandardOutput.ReadLine()
+      if ($null -eq $line) { break }
+      try { $obj = $line | ConvertFrom-Json } catch { continue }
+      if ($obj.ready) { $ready = $obj; break }
+    }
+    if (-not $ready) { try { $proc.Kill() } catch {}; return $false }
+    $script:OcrService = [pscustomobject]@{ Process = $proc; Language = $ready.language; Requests = 0 }
+    return $true
+  } catch {
+    return $false
+  }
+}
+
+function Stop-OcrService {
+  if (-not $script:OcrService) { return }
+  try { $script:OcrService.Process.StandardInput.WriteLine('{"quit":true}'); $script:OcrService.Process.StandardInput.Flush() } catch {}
+  try { if (-not $script:OcrService.Process.WaitForExit(2000)) { $script:OcrService.Process.Kill() } } catch {}
+  $script:OcrService = $null
+}
+
+# 走常驻服务识别一次；任何异常都返回 $null，让调用方回退到旧子进程路径。
+function Invoke-OcrService {
+  param($Region, [string]$Find, [string]$SaveImage, [int[]]$Scales = @(2, 3, 4, 6))
+  if (-not (Start-OcrService)) { return $null }
+  try {
+    $script:OcrService.Requests++
+    $request = [ordered]@{ id = $script:OcrService.Requests; scales = @($Scales) }
+    if ($Region) { $request.region = @([int]$Region.left, [int]$Region.top, [int]$Region.right, [int]$Region.bottom) }
+    if ($Find) { $request.find = $Find }
+    if ($SaveImage) { $request.saveImage = [string]$SaveImage; $request.cropSave = $true; $request.cropCard = $true }
+    $script:OcrService.Process.StandardInput.WriteLine(($request | ConvertTo-Json -Depth 5 -Compress))
+    $script:OcrService.Process.StandardInput.Flush()
+    $line = $script:OcrService.Process.StandardOutput.ReadLine()
+    if ($null -eq $line) { $script:OcrService = $null; return $null }
+    $response = $line | ConvertFrom-Json
+    if (-not $response.ok) { return $null }
+    return $response
+  } catch {
+    try { $script:OcrService.Process.Kill() } catch {}
+    $script:OcrService = $null
+    return $null
+  }
+}
+
+
 $ocrScript = Join-Path $PSScriptRoot 'agent-screen-ocr.ps1'
 $driveScript = Join-Path $script:RepoRoot 'tests\fixtures\agent-drive.cjs'
 foreach ($f in @($ocrScript, $driveScript)) { if (-not (Test-Path $f)) { Fail 2 "缺少文件：$f" } }
 
-# OCR 自检：能创建引擎、能跑通一次识别
-$ocrProbeRaw = & powershell -NoProfile -ExecutionPolicy Bypass -File $ocrScript -Region '0,0,64,64' -Scale 1 2>&1 | Out-String
-try { $ocrProbe = $ocrProbeRaw | ConvertFrom-Json } catch { Fail 2 "OCR 自检输出无法解析：$($ocrProbeRaw.Substring(0, [Math]::Min(300, $ocrProbeRaw.Length)))" }
-if (-not $ocrProbe.ok) { Fail 2 "OCR 自检失败：$($ocrProbe.error)" }
-Write-Step "OCR 可用：语言 $($ocrProbe.language)"
+# OCR 自检：优先启动常驻服务（初始化一次后单次识别 ~100ms）；起不来再退回旧的一次性子进程。
+$ocrReady = Start-OcrService
+if ($ocrReady) {
+  $probe = Invoke-OcrService -Region ([pscustomobject]@{ left = 0; top = 0; right = 64; bottom = 64 }) -Scales @(1)
+  if ($null -eq $probe) { $ocrReady = $false } else { Write-Step "OCR 可用（常驻服务）：语言 $($probe.language)" }
+}
+if (-not $ocrReady) {
+  Stop-OcrService
+  $ocrProbeRaw = & powershell -NoProfile -ExecutionPolicy Bypass -File $ocrScript -Region '0,0,64,64' -Scale 1 2>&1 | Out-String
+  try { $ocrProbe = $ocrProbeRaw | ConvertFrom-Json } catch { Fail 2 "OCR 自检输出无法解析：$($ocrProbeRaw.Substring(0, [Math]::Min(300, $ocrProbeRaw.Length)))" }
+  if (-not $ocrProbe.ok) { Fail 2 "OCR 自检失败：$($ocrProbe.error)" }
+  Write-Step "OCR 可用（一次性进程）：语言 $($ocrProbe.language)"
+}
 
 # ---------------------------------------------------------------- 独立数据目录与截图目录
 
@@ -194,7 +342,7 @@ Write-Step "运行副本：$runExe"
 $agentPrefs = '{"interactive":true,"handoff":0,"completion":true,"dwell":15,"expanded":true,"content":2,"deferred":true,"system_toast":false}'
 $settings = @(
   'notifications=1', 'system_notify=0', 'sound=0', 'read_notifications=0',
-  'dsh_notifications=1', 'codex_notifications=0',
+  'dsh_notifications=1', 'codex_notifications=1',
   "agent_cards=$agentPrefs",
   'hide_fullscreen=0', 'avoid_top_bar=0', 'pet=0', 'island_size=140'
 )
@@ -241,11 +389,118 @@ function Wait-IslandRect([int]$TimeoutSeconds = 15) {
   while ((Get-Date) -lt $deadline) {
     $rect = Get-IslandRect
     if ($rect) { return $rect }
-    Start-Sleep -Milliseconds 200
+    Start-Sleep -Milliseconds 60
   }
   return $null
 }
 function Get-RegionString($region) { "$($region.left),$($region.top),$($region.right),$($region.bottom)" }
+
+# 真实窗口矩形（区别于 Get-IslandRect 的固定取景竖带）：用来判断卡片在不在（卡片展开时窗口会变高）。
+function Get-IslandWindowRect {
+  if (-not $script:islandPid) { return $null }
+  try {
+    $hwnd = [DaozaiE2EInput]::FindWindowForProcess([uint32]$script:islandPid)
+    if ($hwnd -eq [IntPtr]::Zero) { return $null }
+    $rect = New-Object DaozaiE2EInput+RECT
+    if (-not [DaozaiE2EInput]::GetWindowRect($hwnd, [ref]$rect)) { return $null }
+    if (($rect.Right - $rect.Left) -le 0 -or ($rect.Bottom - $rect.Top) -le 0) { return $null }
+    return [pscustomobject]@{ left = $rect.Left; top = $rect.Top; right = $rect.Right; bottom = $rect.Bottom }
+  } catch { return $null }
+}
+
+# ---------------------------------------------------------------- 事件驱动等待
+# 以前「点一下等 500~900ms」「场景之间等 800ms」是纯猜时间：慢了拖总时长，快了打空。
+# 现在改成看屏幕像素指纹与窗口矩形：动手时先记下当前画面，然后轮询「画面变了 / 稳定了 / 某段文字出现」，
+# 命中就立刻返回，超时才退回原来的固定等待量（保证最坏情况不比以前差）。
+$script:CardWaitMaxMs = 6000
+
+# 捕获某区域的降采样灰度指纹（默认把区域切成 48x18 网格）。
+function Get-RegionSignature($Region) {
+  if (-not $Region) { return $null }
+  $w = [int]$Region.right - [int]$Region.left
+  $h = [int]$Region.bottom - [int]$Region.top
+  if ($w -le 0 -or $h -le 0) { return $null }
+  try { return [DaozaiE2EScreen]::Signature([int]$Region.left, [int]$Region.top, $w, $h, 48, 18) }
+  catch { return $null }
+}
+
+# 两个指纹的差异（平均灰度差）；任一为空时返回一个大数表示"未知=当作变了"。
+function Get-SignatureDelta($A, $B) {
+  if ($null -eq $A -or $null -eq $B -or $A.Length -ne $B.Length) { return [double]::MaxValue }
+  $sum = 0.0
+  for ($i = 0; $i -lt $A.Length; $i++) { $sum += [Math]::Abs($A[$i] - $B[$i]) }
+  return $sum / $A.Length
+}
+
+# 等画面「变化」：先存基线，然后快速轮询指纹，命中即返回（-Delta 阈值，默认 1.5 灰度级）。
+function Wait-ScreenChange {
+  param($Region, [int]$TimeoutMs = 1200, [double]$Delta = 1.5, $Baseline)
+  $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
+  $baseSig = if ($null -ne $Baseline) { $Baseline } else { Get-RegionSignature $Region }
+  $sw = [System.Diagnostics.Stopwatch]::StartNew()
+  while ((Get-Date) -lt $deadline) {
+    $sig = Get-RegionSignature $Region
+    if ($null -ne $sig -and (Get-SignatureDelta $baseSig $sig) -ge $Delta) {
+      return [pscustomobject]@{ changed = $true; waitedMs = $sw.ElapsedMilliseconds; signature = $sig }
+    }
+    Start-Sleep -Milliseconds 25
+  }
+  return [pscustomobject]@{ changed = $false; waitedMs = $sw.ElapsedMilliseconds; signature = (Get-RegionSignature $Region) }
+}
+
+# 等画面「稳定」：连续 -StableFrames 次采样差异都低于阈值，说明动画/淡入结束，可以安全截图与点击。
+function Wait-ScreenStable {
+  param($Region, [int]$TimeoutMs = 1200, [double]$Delta = 1.0, [int]$StableFrames = 3)
+  $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
+  $sw = [System.Diagnostics.Stopwatch]::StartNew()
+  $last = Get-RegionSignature $Region
+  $stable = 0
+  while ((Get-Date) -lt $deadline) {
+    Start-Sleep -Milliseconds 25
+    $sig = Get-RegionSignature $Region
+    if ($null -ne $sig -and $null -ne $last -and (Get-SignatureDelta $last $sig) -lt $Delta) { $stable++ } else { $stable = 0 }
+    $last = $sig
+    if ($stable -ge $StableFrames) { return [pscustomobject]@{ stable = $true; waitedMs = $sw.ElapsedMilliseconds } }
+  }
+  return [pscustomobject]@{ stable = $false; waitedMs = $sw.ElapsedMilliseconds }
+}
+
+# 等「上一张卡片退场」：岛仔窗口高度是固定画布（卡片不改变窗口尺寸），所以用画面指纹判断——
+# 启动后在无卡片状态记下基线，之后轮询到画面与该基线足够接近就算退场。
+# 注意：鼠标停在岛上会让岛体保持 hover 展开、指纹回不到基线，所以先把鼠标移开。
+function Move-MouseAway {
+  try { [void][DaozaiE2EInput]::SetCursorPos(6, 6) } catch { }
+}
+function Wait-CardGone([int]$TimeoutMs = 1500) {
+  $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
+  $sw = [System.Diagnostics.Stopwatch]::StartNew()
+  Move-MouseAway
+  $region = Get-LiveRegion $null
+  $baseline = $script:PillSignature
+  if ($null -eq $baseline) { $baseline = Get-RegionSignature $region }
+  $last = $null
+  $stable = 0
+  while ((Get-Date) -lt $deadline) {
+    if (-not (Get-Process -Id $script:islandPid -ErrorAction SilentlyContinue)) {
+      return [pscustomobject]@{ gone = $true; waitedMs = $sw.ElapsedMilliseconds }
+    }
+    $sig = Get-RegionSignature $region
+    if ($null -ne $sig) {
+      # 优先判「回到收起态基线」；回不去（例如卡片退场动画停在中间帧）时退而求其次判「画面稳定」，
+      # 下一场景的 Wait-Text 会自己等新卡片出现，不必把时间耗在等一张旧卡片彻底消失上。
+      if ($null -ne $baseline -and (Get-SignatureDelta $baseline $sig) -lt 3.0) {
+        return [pscustomobject]@{ gone = $true; waitedMs = $sw.ElapsedMilliseconds }
+      }
+      if ($null -ne $last -and (Get-SignatureDelta $last $sig) -lt 1.0) { $stable++ } else { $stable = 0 }
+      if ($stable -ge 3) {
+        return [pscustomobject]@{ gone = $true; waitedMs = $sw.ElapsedMilliseconds }
+      }
+    }
+    $last = $sig
+    Start-Sleep -Milliseconds 40
+  }
+  return [pscustomobject]@{ gone = $false; waitedMs = $sw.ElapsedMilliseconds }
+}
 
 # 卡片出现/展开会让岛仔窗口变大；每轮都重新取一次窗口矩形，避免只截到收起态的小窗口。
 # 取不到（窗口正在重建/瞬间不可见）时退回上一次可用的矩形，再退回屏幕中心竖带。
@@ -270,6 +525,8 @@ function Get-LiveRegion($fallback) {
 function Invoke-Ocr {
   param($Region, [string]$Find, [string]$SaveImage, [int[]]$Scales = @(2, 3, 4, 6))
   $Region = Get-LiveRegion $Region
+  $served = Invoke-OcrService -Region $Region -Find $Find -SaveImage $SaveImage -Scales $Scales
+  if ($served) { return $served }
   $cli = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $ocrScript, '-Region', (Get-RegionString $Region), '-FindScales', ($Scales -join ','))
   if ($Find) { $cli += @('-Find', $Find) }
   if ($SaveImage) { $cli += @('-SaveImage', $SaveImage, '-CropSave', '-CropCard') }
@@ -287,6 +544,8 @@ function Invoke-Ocr {
 function Invoke-OcrScan {
   param($Region, [int]$Scale = 2, [string]$SaveImage)
   $Region = Get-LiveRegion $Region
+  $served = Invoke-OcrService -Region $Region -SaveImage $SaveImage -Scales @($Scale)
+  if ($served) { return $served }
   $cli = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $ocrScript, '-Region', (Get-RegionString $Region), '-Scale', [string]$Scale)
   if ($SaveImage) { $cli += @('-SaveImage', $SaveImage, '-CropSave', '-CropCard') }
   $previous = $ErrorActionPreference
@@ -335,22 +594,23 @@ function Find-LineMatch {
 
 # 轮询直到任意一个候选文字出现；每次轮询只跑 1-2 遍 OCR（2 倍、必要时 3 倍）。
 function Wait-Text {
-  param($Region, [string[]]$Texts, [int]$TimeoutSeconds, [string]$ShotOnFound, [string]$ShotOnTimeout)
+  param($Region, [string[]]$Texts, [int]$TimeoutSeconds, [string]$ShotOnFound, [string]$ShotOnTimeout,
+        [int[]]$Scales = @(2, 3), [switch]$PreferBottom, [int]$MaxExtra = -1)
   $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
   $attempt = 0
   while ((Get-Date) -lt $deadline) {
     $attempt++
     # 息屏/闲置会让截图停在旧帧，每轮先抖一下鼠标再识别。
     [DaozaiE2EInput]::Nudge()
-    foreach ($scale in @(2, 3)) {
+    foreach ($scale in $Scales) {
       $ocr = Invoke-OcrScan -Region $Region -Scale $scale
-      $match = Find-LineMatch -Ocr $ocr -Texts $Texts
+      $match = Find-LineMatch -Ocr $ocr -Texts $Texts -PreferBottom:$PreferBottom -MaxExtra $MaxExtra
       if ($match) {
         if ($ShotOnFound) { $null = Invoke-OcrScan -Region $Region -Scale $scale -SaveImage $ShotOnFound }
         return [pscustomobject]@{ found = $true; center = $match.center; text = $match.text; line = $match.line; attempts = $attempt }
       }
     }
-    Start-Sleep -Milliseconds 250
+    Start-Sleep -Milliseconds 80
   }
   if ($ShotOnTimeout) { $null = Invoke-OcrScan -Region (Get-LiveRegion $Region) -Scale 2 -SaveImage $ShotOnTimeout }
   return $null
@@ -371,9 +631,15 @@ function Find-AnyText {
 function Click-Point($center) {
   $x = [int]$center[0]; $y = [int]$center[1]
   if ($NoClick) { Write-Step "  （-NoClick）本应点击 ($x,$y)"; return $true }
+  # 点之前先等画面稳定（淡入动画中点到的坐标可能是旧布局），避免「点空」。
+  $null = Wait-ScreenStable -Region (Get-LiveRegion $null) -TimeoutMs 600 -StableFrames 2
+  $baseline = Get-RegionSignature (Get-LiveRegion $null)
   $ok = [DaozaiE2EInput]::Click($x, $y)
   Write-Step "  点击 ($x,$y) -> $ok"
-  Start-Sleep -Milliseconds 500
+  # 事件驱动：等这次点击真的让界面发生变化（最多 900ms），而不是固定睡 500ms。
+  # 变化通常 100~200ms 就到；没变化（例如点在不改变画面的位置）也最多只等到超时，不比以前慢。
+  $change = Wait-ScreenChange -Region (Get-LiveRegion $null) -TimeoutMs 900 -Baseline $baseline
+  if ($change.changed) { Write-Step ("  界面已响应（{0}ms）" -f $change.waitedMs) }
   return $ok
 }
 
@@ -381,7 +647,7 @@ function Wait-DriverExit([int]$DriverPid, [int]$TimeoutSeconds) {
   $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
   while ((Get-Date) -lt $deadline) {
     if (-not (Get-Process -Id $DriverPid -ErrorAction SilentlyContinue)) { return $true }
-    Start-Sleep -Milliseconds 250
+    Start-Sleep -Milliseconds 80
   }
   return $false
 }
@@ -430,7 +696,7 @@ function Start-Island {
       } catch { }
     }
     if (-not (Get-Process -Id $script:islandPid -ErrorAction SilentlyContinue)) { return $false }
-    Start-Sleep -Milliseconds 200
+    Start-Sleep -Milliseconds 80
   }
   return $false
 }
@@ -441,7 +707,11 @@ function Stop-Island {
     if ($p) { Stop-Process -Id $script:islandPid -Force -ErrorAction SilentlyContinue; Write-Step "已停止岛仔 PID=$($script:islandPid)" }
     $script:islandPid = $null
   }
-  Start-Sleep -Milliseconds 600
+  # 事件驱动：等进程真的消失（最多 2s），而不是固定睡 600ms 赌它退干净了。
+  $deadline = (Get-Date).AddSeconds(2)
+  while ((Get-Date) -lt $deadline -and @(Get-Process -Name 'daozai*' -ErrorAction SilentlyContinue).Count) {
+    Start-Sleep -Milliseconds 40
+  }
 }
 
 # ---------------------------------------------------------------- 场景参数
@@ -449,6 +719,19 @@ function Stop-Island {
 # 场景名 -> 驱动场景 + 屏幕侧动作参数
 function Get-ScenarioSpec([string]$name) {
   switch ($name) {
+    'codex-approval' {
+      # 模拟 Codex 客户端执行 PermissionRequest hook 时喂给 notify.cjs 的 stdin 事件（字段与 Codex 一致）。
+      return [pscustomobject]@{
+        driver = 'codex-approval'
+        request = [ordered]@{
+          hook_event_name = 'PermissionRequest'
+          tool_name = 'shell'
+          cwd = 'C:\Users\59531'
+          tool_input = [ordered]@{ command = 'Remove-Item C:\Temp\daozai-e2e-codex.txt' }
+        }
+        options = @()
+      }
+    }
     'approval' {
       return [pscustomobject]@{
         driver = 'approval'
@@ -490,7 +773,12 @@ try {
   if (-not (Start-Island)) {
     Fail 3 '岛仔没有在 30 秒内发布桥接通道（检查设置里 DSH 来源是否打开、exe 是否能正常启动）'
   }
-  Start-Sleep -Milliseconds 800
+  # 事件驱动：等窗口真的建出来再开始；并记下「无卡片」时的画面指纹，供场景切换判断卡片是否退场。
+  $null = Wait-IslandRect 10
+  Move-MouseAway
+  $null = Wait-ScreenStable -Region (Get-LiveRegion $null) -TimeoutMs 1500 -StableFrames 3
+  $script:PillSignature = Get-RegionSignature (Get-LiveRegion $null)
+  Write-Step ("岛仔窗口就绪，已记录收起态画面基线（{0} 项采样）" -f $(if ($script:PillSignature) { $script:PillSignature.Length } else { 0 }))
 
   Set-EnvVar 'ELECTRON_RUN_AS_NODE' '1'
   Set-EnvVar 'DSH_HOME' (Join-Path $DataDir 'dsh-home')
@@ -509,11 +797,17 @@ try {
 
     $driverArgs = @($driveScript, '--profile', $profileDir, '--scenario', $spec.driver,
       '--wait', [string]($WaitSeconds * 1000), '--json-in', $jsonIn)
-    $driver = Start-Process -FilePath $dshExe -ArgumentList $driverArgs -PassThru -WorkingDirectory $script:RepoRoot `
-      -RedirectStandardOutput $stdout -RedirectStandardError $stderr
-    Write-Step "  驱动 PID=$($driver.Id)"
+    # codex-approval 场景不需要 DSH 驱动：它直接模拟 Codex 客户端执行 PermissionRequest hook。
+    if ($name -eq 'codex-approval') {
+      $driver = $null
+      Write-Step '  驱动：无（直连 Codex hook 通道）'
+    } else {
+      $driver = Start-Process -FilePath $dshExe -ArgumentList $driverArgs -PassThru -WorkingDirectory $script:RepoRoot `
+        -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+      Write-Step "  驱动 PID=$($driver.Id)"
+    }
 
-    $verdict = [pscustomobject]@{ scenario = $name; ok = $false; steps = @(); driver = $null; error = $null; bridgeOk = $false; duration = 0 }
+    $verdict = [pscustomobject]@{ scenario = $name; ok = $false; steps = @(); driver = $null; error = $null; bridgeOk = ($name -eq 'codex-approval'); duration = 0 }
 
     $region = Wait-IslandRect 15
     if (-not $region) {
@@ -539,6 +833,42 @@ try {
       }
       Stop-Process -Id $driver.Id -Force -ErrorAction SilentlyContinue
     }
+    elseif ($name -eq 'codex-approval') {
+      # Codex 来源验收：不经过 DSH 驱动，而是直接模拟 Codex 客户端执行 PermissionRequest hook
+      # （与 Codex 真实调用完全相同的命令与 stdin 契约），再在岛上点允许，校验 hook 返回的决策 JSON。
+      $hookOut = "$shotBase-hook.json"
+      $hookErr = "$shotBase-hook.err.log"
+      $hookIn = "$shotBase-hook-input.json"
+      [System.IO.File]::WriteAllText($hookIn, ($spec.request | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($false)))
+      $ocHook = Start-Process -FilePath 'C:\Program Files\nodejs\node.exe' `
+        -ArgumentList @((Join-Path $DataDir 'agent-notices\bridge\notify.cjs'), 'approval') `
+        -RedirectStandardInput $hookIn -RedirectStandardOutput $hookOut -RedirectStandardError $hookErr `
+        -PassThru -WindowStyle Hidden
+      $verdict.steps += [pscustomobject]@{ step = 'Codex hook 已启动'; ok = $true; text = "PID=$($ocHook.Id)" }
+
+      $hit = Wait-Text -Region $region -Texts @('等待你审批', '等待审批') -TimeoutSeconds 25 -ShotOnFound "$shotBase-01-banner.png" -ShotOnTimeout "$shotBase-01-timeout.png"
+      $verdict.steps += [pscustomobject]@{ step = '等到审批卡片'; ok = [bool]$hit; text = $(if ($hit) { $hit.text } else { $null }) }
+      if (-not $hit) { $verdict.error = '25 秒内没有在岛上看到审批卡片' }
+      else {
+        $region = Get-IslandRect
+        $detail = Find-AnyText -Region $region -Texts @('仅允许这一次', '允许这一次') -SaveImage "$shotBase-02-detail.png" -PreferBottom
+        if (-not $detail) {
+          $review = Find-AnyText -Region $region -Texts @('查看并审批', '查看并', '查看') -SaveImage "$shotBase-02-review.png"
+          if ($review) { $null = Click-Point $review.center; $detail = Wait-Text -Region (Get-IslandRect) -Texts @('仅允许这一次', '允许这一次') -TimeoutSeconds 12 }
+        }
+        $verdict.steps += [pscustomobject]@{ step = '审批详情可见'; ok = [bool]$detail; text = $(if ($detail) { $detail.text } else { $null }) }
+        if ($detail) {
+          $null = Click-Point $detail.center
+          $exited = $ocHook.WaitForExit(8000)
+          $verdict.steps += [pscustomobject]@{ step = 'hook 已返回决策'; ok = [bool]$exited; text = $(if ($exited) { '已退出' } else { '8s 未退出' }) }
+          $decision = if (Test-Path $hookOut) { (Get-Content -Raw -LiteralPath $hookOut).Trim() } else { '' }
+          $allow = $decision -match '"behavior"\s*:\s*"allow"'
+          $verdict.steps += [pscustomobject]@{ step = '决策为 allow'; ok = $allow; text = $decision }
+          if (-not $allow) { $verdict.error = "Codex hook 没有返回 allow 决策：$decision" } else { $verdict.ok = $true }
+        }
+      }
+      if (-not $ocHook.HasExited) { Stop-Process -Id $ocHook.Id -Force -ErrorAction SilentlyContinue }
+    }
     elseif ($name -eq 'approval') {
       $hit = Wait-Text -Region $region -Texts @('等待你审批', '等待审批') -TimeoutSeconds 25 -ShotOnFound "$shotBase-01-banner.png" -ShotOnTimeout "$shotBase-01-timeout.png"
       $verdict.steps += [pscustomobject]@{ step = '等到审批卡片'; ok = [bool]$hit; text = $(if ($hit) { $hit.text } else { $null }) }
@@ -552,7 +882,6 @@ try {
           $verdict.steps += [pscustomobject]@{ step = '打开审批详情'; ok = [bool]$review; text = $(if ($review) { $review.text } else { $null }) }
           if ($review) {
             $null = Click-Point $review.center
-            Start-Sleep -Milliseconds 900
             $region = Get-IslandRect
             $detail = Wait-Text -Region $region -Texts @('仅允许这一次', '允许这一次') -TimeoutSeconds 12 -ShotOnFound "$shotBase-03-detail.png" -ShotOnTimeout "$shotBase-03-timeout.png"
           }
@@ -600,9 +929,9 @@ try {
           $verdict.steps += [pscustomobject]@{ step = '点击「下一题」'; ok = [bool]$next; text = $(if ($next) { $next.text } else { $null }) }
           if ($next) {
             $null = Click-Point $next.center
-            Start-Sleep -Milliseconds 700
             $region = Get-IslandRect
-            $hit2 = Find-AnyText -Region $region -Texts @('确认一') -SaveImage "$shotBase-04-option2.png" -PreferBottom -Scales @(3, 4, 5, 6, 2) -MaxExtra 2
+            # 事件驱动：等第 2 题真的渲染出来（最多 12s），不再固定睡 700ms 后一次性找。
+            $hit2 = Wait-Text -Region $region -Texts @('确认一') -TimeoutSeconds 12 -ShotOnFound "$shotBase-04-option2.png" -Scales @(3, 4, 5, 6, 2) -MaxExtra 2 -PreferBottom
             $verdict.steps += [pscustomobject]@{ step = '点击第 2 题选项'; ok = [bool]$hit2; text = $(if ($hit2) { $hit2.text } else { $null }); line = $(if ($hit2) { $hit2.line } else { $null }) }
             if ($hit2) { $null = Click-Point $hit2.center } else { $okOptions = $false }
           } else { $okOptions = $false }
@@ -618,7 +947,7 @@ try {
               $cand = Find-AnyText -Region $region -Texts @($t) -SaveImage "$shotBase-05-submit.png" -PreferBottom
               if ($cand) { $submit = $cand; break }
             }
-            if (-not $submit) { Start-Sleep -Milliseconds 500 }
+            if (-not $submit) { Start-Sleep -Milliseconds 120 }
           }
           $verdict.steps += [pscustomobject]@{ step = '找到提交按钮'; ok = [bool]$submit; text = $(if ($submit) { $submit.text } else { $null }) }
           if (-not $submit) { $verdict.error = '没有识别到提交类按钮' }
@@ -650,7 +979,6 @@ try {
         $marker = $null
         if ($open) {
           $null = Click-Point $open.center
-          Start-Sleep -Milliseconds 900
           $region = Get-IslandRect
           $result = Wait-Text -Region $region -Texts @('本轮回复', '复制内容', '可滚动阅读') -TimeoutSeconds 10 -ShotOnFound "$shotBase-03-result.png" -ShotOnTimeout "$shotBase-03-timeout.png"
           $verdict.steps += [pscustomobject]@{ step = '看到结果正文层'; ok = [bool]$result; text = $(if ($result) { $result.text } else { $null }); fatal = $false }
@@ -670,29 +998,36 @@ try {
       }
     }
 
-    # 等驱动收敛并拿结论
-    if ($verdict.error) {
-      # 交互失败就别等满 --wait：给驱动 3 秒收尾（例如详情已点到但截图晚了一步），否则杀掉。
-      $exited = Wait-DriverExit -DriverPid $driver.Id -TimeoutSeconds 3
-      if (-not $exited) { Stop-Process -Id $driver.Id -Force -ErrorAction SilentlyContinue }
-    } else {
-      $exited = Wait-DriverExit -DriverPid $driver.Id -TimeoutSeconds ($WaitSeconds + 5)
-      if (-not $exited) {
-        Stop-Process -Id $driver.Id -Force -ErrorAction SilentlyContinue
-        $verdict.error = "驱动在 $($WaitSeconds + 5) 秒内没有退出（卡片一直没作答？）"
+    # 等驱动收敛并拿结论（codex-approval 没有 DSH 驱动，跳过这一段）
+    if ($null -ne $driver) {
+      if ($verdict.error) {
+        # 交互失败就别等满 --wait：给驱动 3 秒收尾（例如详情已点到但截图晚了一步），否则杀掉。
+        $exited = Wait-DriverExit -DriverPid $driver.Id -TimeoutSeconds 3
+        if (-not $exited) { Stop-Process -Id $driver.Id -Force -ErrorAction SilentlyContinue }
+      } else {
+        $exited = Wait-DriverExit -DriverPid $driver.Id -TimeoutSeconds ($WaitSeconds + 5)
+        if (-not $exited) {
+          Stop-Process -Id $driver.Id -Force -ErrorAction SilentlyContinue
+          $verdict.error = "驱动在 $($WaitSeconds + 5) 秒内没有退出（卡片一直没作答？）"
+        }
       }
+      # 驱动进程退出与重定向文件落盘之间有毫秒级窗口，别只读一次：
+      # 第一轮实测就踩到「进程已退、文件还没刷出来」，把成功的场景判成失败。
+      $json = $null
+      $readDeadline = (Get-Date).AddSeconds(5)
+      while ((Get-Date) -lt $readDeadline -and -not $json) {
+        $json = Read-DriverJson $stdout
+        if (-not $json) { Start-Sleep -Milliseconds 60 }
+      }
+      $verdict.driver = $json
+    } else {
+      $json = $null
     }
-    # 驱动进程退出与重定向文件落盘之间有毫秒级窗口，别只读一次：
-    # 第一轮实测就踩到「进程已退、文件还没刷出来」，把成功的场景判成失败。
-    $json = $null
-    $readDeadline = (Get-Date).AddSeconds(5)
-    while ((Get-Date) -lt $readDeadline -and -not $json) {
-      $json = Read-DriverJson $stdout
-      if (-not $json) { Start-Sleep -Milliseconds 200 }
-    }
-    $verdict.driver = $json
     if ($NoClick) {
       # 视觉检查模式：驱动被主动结束，不判桥接决定。
+    }
+    elseif ($name -eq 'codex-approval') {
+      # 结论已在场景分支里按 hook 返回的决策 JSON 校验过（bridgeOk 由那里的 allow 判定置位）。
     }
     elseif (-not $json) {
       if (-not $verdict.error) { $verdict.error = '驱动没有输出 JSON（见 *-driver.err.log）' }
@@ -735,11 +1070,16 @@ try {
     if ($verdict.ok) { Write-Step "场景 $name 通过（$($verdict.duration)s）" }
     else { Write-Step "场景 $name 失败：$($verdict.error)"; $script:Failures += "${name}: $($verdict.error)" }
 
-    # 场景之间留点时间，让上一张卡片退场。
-    Start-Sleep -Milliseconds 800
+    # 事件驱动：等上一张卡片真的退场（画面指纹回到收起态基线），而不是固定睡 800ms。
+    # 最后一个场景之后不用等（后面就是汇总与收尾）。
+    if ($name -ne $scenarios[-1]) {
+      $gone = Wait-CardGone -TimeoutMs 1500
+      Write-Step ("  上一张卡片已退场（{0}ms，{1}）" -f $gone.waitedMs, $(if ($gone.gone) { '已确认' } else { '超时后按原时长继续' }))
+    }
   }
 } finally {
   if (-not $KeepAlive) { Stop-Island }
+  Stop-OcrService
   Restore-Env
 }
 

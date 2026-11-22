@@ -246,7 +246,6 @@ pub(crate) struct ResultCard {
     /// 本机生成的说明（无正文时的占位），不是宿主正文。
     pub hint: bool,
 }
-
 /// 收起卡（banner）的只读展示信息。
 pub(crate) struct BannerInfo {
     pub subtitle: String,
@@ -255,9 +254,34 @@ pub(crate) struct BannerInfo {
     pub provider: Provider,
 }
 
+/// 常驻角标的一类事项：待审批 / 待回答 / 已完成待查看。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BadgeKind { Approval, Question, Done }
+
+impl BadgeKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Approval => "等待你审批",
+            Self::Question => "等你回答",
+            Self::Done => "本轮已结束",
+        }
+    }
+}
+
+/// 岛体侧边的常驻提醒条目（与喝水/久坐角标同一条通道）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Badge {
+    pub provider: Provider,
+    pub kind: BadgeKind,
+    /// 请求 id；完成通知为空串。
+    pub id: String,
+    pub title: String,
+    /// 完成通知的跳转目标（点击角标直接回原会话）。
+    pub jump: Option<crate::agent_jump::Target>,
+}
+
 #[derive(Default)]
-pub struct Cards {
-    service:Option<Service>, retry:Option<Instant>, requests:VecDeque<Request>,
+pub struct Cards {    service:Option<Service>, retry:Option<Instant>, requests:VecDeque<Request>,
     pub(crate) dsh_ready:bool,
     pub(crate) hovering:bool,
     /// 完成通知的「查看回复」内容；Some 表示结果层打开。
@@ -269,6 +293,14 @@ pub struct Cards {
     copied_at:Option<Instant>,
     /// 最近一次跳转失败的原因，显示在详情卡上，不做静默失败。
     pub(crate) jump_error:Option<String>,
+    /// 最近一次完成事件对应的客户端会话：完成卡正文可点击跳回原会话，
+    /// 而 `agent_finished` 只带得动 provider + 正文，session_id/cwd 在这一层先解析好。
+    done_jump:Option<crate::agent_jump::Target>,
+    /// 常驻提醒入口：所有还没被用户处理掉的 Agent 事项（待审批/待回答/已完成未查看）。
+    /// 由 `badges()` 按当前请求队列与完成状态现算，不单独存状态，避免两处不同步。
+    /// 完成通知还在等用户看一眼：冒泡消失后岛体侧边仍要留一个常驻角标。
+    done_pending:bool,
+    done_provider:Option<Provider>,
     /// 测试观察用：记录被交回的请求 id，生产构建不编译。
     #[cfg(test)]
     pub(crate) handed_back:Vec<String>,
@@ -332,6 +364,34 @@ impl Cards {
         let r=self.requests.iter().find(|r|r.id==id)?;
         Some(crate::agent_jump::resolve(r.provider,&r.data.session_id,&r.data.cwd))
     }
+    /// 最近一次完成事件对应的客户端会话目标：完成卡正文点击时用。
+    pub(crate) fn finished_jump(&self)->Option<crate::agent_jump::Target>{self.done_jump.clone()}
+    /// 收到完成通知：记为「待查看」，岛体侧边留一个常驻角标（冒泡消失后仍然可见）。
+    pub(crate) fn note_finished(&mut self,provider:Provider){self.done_pending=true;self.done_provider=Some(provider);}
+    /// 用户看过/关掉完成通知：角标消失。
+    pub(crate) fn done_seen(&mut self){self.done_pending=false;self.done_provider=None;}
+    /// 岛体侧边的常驻提醒：待审批 / 待回答 / 已完成但还没被查看的完成通知。
+    pub(crate) fn badges(&self)->Vec<Badge>{
+        let mut out:Vec<Badge>=self.requests.iter().map(|r|Badge{
+            provider:r.provider,
+            kind:if r.question{BadgeKind::Question}else{BadgeKind::Approval},
+            id:r.id.clone(),
+            title:r.title().to_owned(),
+            jump:None,
+        }).collect();
+        if self.done_pending {
+            if let Some(provider)=self.done_provider {
+                out.push(Badge{
+                    provider,
+                    kind:BadgeKind::Done,
+                    id:String::new(),
+                    title:crate::agent_notice::Status::Finished.label().to_owned(),
+                    jump:self.done_jump.clone(),
+                });
+            }
+        }
+        out
+    }
     /// 取走一次跳转失败原因，交给上层用岛上提示显示。
     pub(crate) fn take_jump_error(&mut self)->Option<String>{self.jump_error.take()}
     /// 是否正在编辑（阻止自动交回、阻止岛体收起）。
@@ -344,7 +404,7 @@ impl Cards {
         let Some(m) = self.measurer() else {
             return (agent_ui::CARD_W, if compact { 44.0 } else { 112.0 });
         };
-        let view = agent_ui::DoneView { provider, kicker: "本轮已结束", text, compact, age: 1.0 };
+        let view = agent_ui::DoneView { provider, kicker: "本轮已结束", text, compact, age: 1.0, jump: self.done_jump.is_some() };
         agent_ui::measure_done(&m, &view)
     }
     pub(crate) fn detail_size(&self, id:&str)->(f32,f32){
@@ -541,8 +601,18 @@ impl Cards {
         let Some(kind)=v["kind"].as_str() else{self.hand_back(&id);return None;};
         if !provider.enabled(settings){self.hand_back(&id);return None;}
         let Ok(data)=serde_json::from_value::<Data>(v["data"].clone()) else {self.hand_back(&id);return None;};
-        if kind=="finished" {return settings.agent.completion.then(||(provider,match settings.agent.content{
-            1=>data.text.chars().take(1200).collect(),2=>data.text.chars().take(32000).collect(),_=>String::new()}));}
+        if kind=="finished" {
+            if !settings.agent.completion { return None; }
+            // 完成卡正文支持「点击跳回原会话」：这里先把会话目标解析好，随通知一起交给 UI 层。
+            // Codex 没有线程标识时会退化成「切到客户端/打开工作目录」，与详情卡的跳转语义一致。
+            self.done_jump = Some(crate::agent_jump::resolve(provider, &data.session_id, &data.cwd));
+            // 冒泡消失后仍要留常驻角标：完成事项在用户点开/关掉之前一直算「待查看」。
+            self.note_finished(provider);
+            return Some((provider, match settings.agent.content {
+                1=>data.text.chars().take(1200).collect(),
+                2=>data.text.chars().take(32000).collect(),
+                _=>String::new()}));
+        }
         let bad_question=kind=="question" && (data.questions.is_empty() || question_violation(&data.questions).is_some());
         if !settings.agent.interactive || data.deferred && !settings.agent.deferred || self.requests.len()>=32
             || !["approval","question"].contains(&kind) || bad_question {self.hand_back(&id);return None;}
@@ -560,7 +630,7 @@ impl Cards {
             settings.notifications,settings.dsh_notifications,settings.agent.interactive,self.service.is_some(),
             self.retry.is_some_and(|t|t>Instant::now())));
         if !dsh{self.dsh_ready=false;}
-        if !dsh&&!codex {self.service=None;self.requests.clear();self.result=None;self.retry=None;return vec![];}
+        if !dsh&&!codex {self.service=None;self.requests.clear();self.result=None;self.retry=None;self.done_jump=None;self.done_seen();return vec![];}
         if self.service.as_mut().is_some_and(|s|s.child.try_wait().ok().flatten().is_some()){
             self.dsh_ready=false;self.service=None;self.requests.clear();self.retry=Some(Instant::now()+Duration::from_secs(2));
         }
@@ -609,6 +679,35 @@ mod tests {
         let mut settings=Settings::default();
         settings.dsh_notifications=true;
         settings
+    }
+
+    #[test]
+    fn pending_requests_and_unseen_finish_become_persistent_badges(){
+        // 需求：Agent 消息未处理时，像喝水/久坐一样常驻在岛体侧边，不依赖卡片冒泡那几秒。
+        let mut cards=Cards::default();
+        let settings=dsh_on();
+        cards.receive(json!({"id":"badge-approval","provider":"dsh","kind":"approval",
+            "data":{"tool":"bash","cwd":"C:\\work"}}),&settings);
+        let badges=cards.badges();
+        assert_eq!(badges.len(),1,"待审批应生成常驻角标");
+        assert_eq!(badges[0].kind,BadgeKind::Approval);
+        assert_eq!(badges[0].id,"badge-approval");
+        // 完成通知：冒泡消失后仍然算「待查看」，并带上跳转目标。
+        let done=cards.receive(json!({"id":"badge-done","provider":"dsh","kind":"finished",
+            "data":{"text":"## 完成\n- 正文","sessionId":"sess-badge","cwd":"C:\\work"}}),&settings);
+        assert!(done.is_some());
+        let badges=cards.badges();
+        assert_eq!(badges.len(),2,"待审批 + 已完成待查看各一条");
+        let done_badge=badges.iter().find(|b|b.kind==BadgeKind::Done).expect("应有已完成角标");
+        assert!(done_badge.jump.is_some(),"已完成角标要能跳回原会话");
+        // 用户看过完成通知：只剩待审批。
+        cards.done_seen();
+        let badges=cards.badges();
+        assert_eq!(badges.len(),1);
+        assert_eq!(badges[0].kind,BadgeKind::Approval);
+        // 请求交回后角标全部消失。
+        cards.hand_back("badge-approval");
+        assert!(cards.badges().is_empty(),"处理完的事项不能继续挂着角标");
     }
 
     #[test]
@@ -723,13 +822,23 @@ mod tests {
     }
 
     #[test]
-    fn jump_target_for_dsh_points_at_its_client(){
+    fn jump_target_for_dsh_points_at_its_session(){
         let mut cards=Cards::default();
         cards.receive(json!({"id":"d","provider":"dsh","kind":"approval","data":{
             "tool":"Bash","operation":"ls","sessionId":"s-1","cwd":"C:\\work"}}),&dsh_on());
         assert_eq!(cards.jump_target("d"),
+            Some(crate::agent_jump::Target::Session{provider:crate::agent_notice::Provider::Dsh,session_id:"s-1".to_owned()}),
+            "DSH 有会话标识时应走插件精确导航，而不是只切窗口");
+    }
+
+    #[test]
+    fn jump_target_for_dsh_without_session_falls_back_to_client_window(){
+        let mut cards=Cards::default();
+        cards.receive(json!({"id":"d2","provider":"dsh","kind":"approval","data":{
+            "tool":"Bash","operation":"ls","cwd":"C:\\work"}}),&dsh_on());
+        assert_eq!(cards.jump_target("d2"),
             Some(crate::agent_jump::Target::Client{name:"DeepSeek Harness",cwd:"C:\\work".to_owned()}),
-            "DSH 没有深链协议，应指向客户端窗口并保留目录兜底");
+            "没有会话标识时只能切到客户端窗口");
     }
 
     #[test]

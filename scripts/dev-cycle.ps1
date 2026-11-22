@@ -123,6 +123,34 @@ function Get-Sha256 {
     catch { return $null }
 }
 
+# 强制完整性标签（Mandatory Integrity）：Windows 会按可执行文件的标签启动进程。
+# 工作区若被sandbox/其它 agent 工具打过 Low Mandatory Label，target 下的 exe 会继承 Low，
+# 于是岛仔以 Low Integrity 运行：能建窗口，但写 %APPDATA%/%TEMP% 全部 Access Denied，
+# 表现为「进程在、窗口在、却什么都没发生」（无 startup 日志、无 live.json、无卡片）。
+# 2026-11-21 本机就是被 Codex 沙箱留下的 Low 标签坑了几小时，这里构建后统一兜底修复。
+function Get-IntegrityLabel {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    $line = (& icacls.exe $Path 2>$null | Select-String -Pattern 'Mandatory Level' | Select-Object -First 1)
+    if (-not $line) { return 'None' }
+    if ($line.Line -match 'Low Mandatory Level') { return 'Low' }
+    if ($line.Line -match 'Medium Mandatory Level') { return 'Medium' }
+    if ($line.Line -match 'High Mandatory Level') { return 'High' }
+    return 'Other'
+}
+
+function Repair-ExeIntegrity {
+    param([string]$Path)
+    $label = Get-IntegrityLabel $Path
+    if ($label -eq 'Low') {
+        Write-Log ("  警告：{0} 带「低完整性」标签（工作区目录被沙箱工具标记过）。" -f (Split-Path $Path -Leaf)) 'Yellow'
+        Write-Log '  这会让岛仔以 Low Integrity 运行：窗口能起，但写不了 %APPDATA%/%TEMP%，表现为启动后毫无反应。已自动改为 Medium。' 'Yellow'
+        & icacls.exe $Path /setintegritylevel Medium 2>&1 | Out-Null
+        $label = Get-IntegrityLabel $Path
+    }
+    return $label
+}
+
 function Test-ScriptUtf8Bom {
     $path = $script:ScriptPath
     if (-not $path -or -not (Test-Path -LiteralPath $path)) {
@@ -703,6 +731,7 @@ function Invoke-BuildStep {
     }
 
     Assert-File $script:ExePath '构建产物 daozai.exe' 14
+    $integrity = Repair-ExeIntegrity -Path $script:ExePath
     $item = Get-Item -LiteralPath $script:ExePath
     $sha = Get-Sha256 $script:ExePath
     $script:State.build = [ordered]@{
@@ -712,11 +741,12 @@ function Invoke-BuildStep {
         sizeBytes     = $item.Length
         lastWriteTime = $item.LastWriteTime.ToString('s')
         sha256        = $sha
+        integrity     = $integrity
         seconds       = $result.seconds
         log           = $buildLog
     }
     Write-Log ("  构建成功：{0}" -f $item.FullName) 'Green'
-    Write-Log ("  大小 {0:N0} 字节 | 时间 {1} | SHA256 {2}" -f $item.Length, $item.LastWriteTime, $sha)
+    Write-Log ("  大小 {0:N0} 字节 | 时间 {1} | SHA256 {2} | 完整性 {3}" -f $item.Length, $item.LastWriteTime, $sha, $integrity)
 }
 
 function Invoke-VerifyStep {

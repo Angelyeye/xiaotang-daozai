@@ -14,10 +14,16 @@ function failure(message, exitCode) { return Object.assign(Error(message), {exit
 function samePath(left, right) { return path.relative(left, right) === ''; }
 // 之前某次运行留下的「自己的旧接入目录」：别的岛仔数据目录导出的同一套 kit（package.json 里 name 就是本包，
 // 且路径以 agent-notices/bridge 结尾）。这种要能自愈替换，否则一个旧链接会把之后所有安装都挡在 exit 4。
+// 注意还要覆盖「旧目录已经被删掉」的情况：链接仍指向一个不存在的旧 kit 时读不到 package.json，
+// 但路径形状本身就说明是本 kit 的残留（2026-11-21 实测：Temp 里拷出的 kit 被清理后，
+// 「重试接入」一直报 exit 4「接入配置被其他插件占用」，用户点重试毫无反应）。
 function ownKit(dir) {
   const resolved = path.resolve(dir);
   if (!/[\\/]agent-notices[\\/]bridge$/.test(resolved)) return false;
-  try { return JSON.parse(fs.readFileSync(path.join(resolved, 'package.json'), 'utf8'))?.name === pkg; }
+  let packageJson;
+  try { packageJson = fs.readFileSync(path.join(resolved, 'package.json'), 'utf8'); }
+  catch { return !fs.existsSync(resolved); }
+  try { return JSON.parse(packageJson)?.name === pkg; }
   catch { return false; }
 }
 function ownLinkSpec(spec) {

@@ -61,6 +61,26 @@ test('DSH bundle resolves through the profile, removes its junction but not the 
   assert.ok(fs.existsSync(path.join(kit,'bridge','index.mjs')));
   assert.deepEqual(JSON.parse(fs.readFileSync(file)),old);
 });
+test('DSH client half ships with the package so the profile can load exact session navigation',t=>{
+  // 精确切会话靠客户端半：package.json 必须声明 exports["./client"] + dsh.client，
+  // 并且 navigation-client.js 要被 kit 带出去（否则 DSH 里就没有打开指定会话的能力）。
+  const {kit,dir,run}=fixture(t);
+  const bridge=path.join(kit,'bridge');
+  const manifest=JSON.parse(fs.readFileSync(path.join(bridge,'package.json'),'utf8'));
+  assert.equal(manifest.exports['./client'],'./navigation-client.js');
+  assert.equal(manifest.dsh.client.platform,'web');
+  assert.ok(manifest.dsh.client.inject.includes('@deepseek-ai/dsh-client-ui-workspace'),
+    'client 半依赖 uiWorkspace 才能调用 openSession');
+  const client=fs.readFileSync(path.join(bridge,'navigation-client.js'),'utf8');
+  assert.ok(client.includes("inject: ['uiWorkspace', 'sessions']"),'客户端要注入 uiWorkspace 与 sessions');
+  assert.ok(client.includes('openSession'),'客户端必须调用 uiWorkspace.openSession');
+  // 未注入 endpoint 时插件应静默跳过，不产生本地请求。
+  assert.ok(client.includes("endpoint.startsWith('__')"),'占位符没替换时要早退');
+  fs.writeFileSync(path.join(dir,'package.json'),JSON.stringify({dependencies:{},dsh:{profile:{bundles:[]}}}));
+  assert.equal(run('dsh','install').status,0);
+  const linked=path.join(dir,'node_modules','@daozai','agent-notices','navigation-client.js');
+  assert.ok(fs.existsSync(linked),'profile 里要能解析到客户端模块');
+});
 test('invalid configuration and a foreign package are preserved',t=>{
   const {dir,run}=fixture(t), hooks=path.join(dir,'hooks.json');
   fs.writeFileSync(hooks,'{"hooks":{"Stop":false}}');
@@ -81,6 +101,26 @@ test('a stale link to an older own kit is repaired instead of blocking the insta
   fs.writeFileSync(path.join(dir,'package.json'),JSON.stringify({dependencies:{[name]:spec},dsh:{profile:{bundles:[name]}}}));
   const link=path.join(dir,'node_modules',name);
   fs.mkdirSync(path.dirname(link),{recursive:true});fs.symlinkSync(oldKit,link,'junction');
+  const result=run('dsh','install');
+  assert.equal(result.status,0,[result.error,result.stdout,result.stderr].filter(Boolean).join('\n'));
+  assert.equal(fs.realpathSync(link),fs.realpathSync(path.join(kit,'bridge')));
+  assert.equal(JSON.parse(fs.readFileSync(path.join(dir,'package.json'))).dependencies[name],'link:'+path.join(kit,'bridge').replaceAll('\\','/'));
+});
+test('a stale link whose old kit directory was deleted is still repaired',t=>{
+  // 实测坑（2026-11-21）：临时测试时把 kit 拷到 %TEMP%，后来 Temp 被清理，
+  // profile 里的 junction 仍指向那个已删除的目录 → 读不到 package.json → 被当成「别的插件占用」，
+  // 设置页点「重试接入」毫无反应，只显示「接入配置被其他插件占用」。路径形状本身就是本 kit 的残留，应当自愈。
+  const {dir,kit,run}=fixture(t), name='@daozai/agent-notices';
+  const missingKit=path.join(path.dirname(kit),'deleted data dir','agent-notices','bridge');
+  fs.writeFileSync(path.join(kit,'bridge','target.json'),JSON.stringify(process.execPath));
+  const spec='link:'+missingKit.replaceAll('\\','/');
+  fs.writeFileSync(path.join(dir,'package.json'),JSON.stringify({dependencies:{[name]:spec},dsh:{profile:{bundles:[name]}}}));
+  const link=path.join(dir,'node_modules',name);
+  fs.mkdirSync(path.dirname(link),{recursive:true});
+  // 目标不存在时 Windows 建不了 junction：先建成真实目录再删，留下悬空链接的等价状态。
+  fs.mkdirSync(missingKit,{recursive:true});
+  fs.symlinkSync(missingKit,link,'junction');
+  fs.rmSync(missingKit,{recursive:true,force:true});
   const result=run('dsh','install');
   assert.equal(result.status,0,[result.error,result.stdout,result.stderr].filter(Boolean).join('\n'));
   assert.equal(fs.realpathSync(link),fs.realpathSync(path.join(kit,'bridge')));
