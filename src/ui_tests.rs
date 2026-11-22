@@ -10011,6 +10011,92 @@ fn done_card_status_only_hint_is_not_a_jump_target(){
 }
 
 #[test]
+fn result_layer_reply_body_jumps_back_to_the_client(){
+    // 需求：结果层就是「本轮回复」的完整正文，点正文本身要能回到原会话。
+    // 回归：之前只给完成卡摘要挂了跳转，结果层（用户真正读正文的地方）点正文完全没反应。
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    crate::agent_jump::intercept(true);
+    let mut h=H::new();
+    h.app.settings.dsh_notifications=true;
+    h.app.settings.agent.content=2;
+    h.app.settings.agent.expanded=true;
+    h.app.settings.agent.dwell=15;
+    let settings=h.app.settings.clone();
+    let finished=h.app.agent_cards.receive(serde_json::json!({
+        "id":"result-jump","provider":"dsh","kind":"finished",
+        "data":{"text":"## 本轮完成\n\n这一块是回复正文，点它应该回到原会话。","sessionId":"sess-result","cwd":"C:\\work"}
+    }),&settings).expect("完成事件应转成通知");
+    h.app.agent_finished(finished.0,finished.1);
+    for _ in 0..60 {h.frame(vec![]);}
+    h.click_text("查看回复");
+    for _ in 0..45 {h.frame(vec![]);}
+    assert!(h.app.result_active(),"点查看回复应打开结果层");
+    assert!(h.strings().iter().any(|t|t=="点正文回到会话 · 只读不落盘"),"结果层要有「正文可点」的线索：{:?}",h.strings());
+    let _=crate::agent_jump::take_feedback();
+    assert!(h.app.jump_note_text().is_none(),"还没点正文就不该有跳转结论");
+    h.click_text("这一块是回复正文，点它应该回到原会话。");
+    for _ in 0..10 {h.frame(vec![]);}
+    let note=h.app.jump_note_text().unwrap_or_else(||panic!("点结果层正文必须产生跳转结论，不能是死区域"));
+    assert!(note.contains("会话"),"跳转结论要说明目标：{note}");
+    crate::agent_jump::intercept(false);
+}
+
+#[test]
+fn result_layer_copy_button_is_not_swallowed_by_the_body_jump(){
+    // 正文很短时正文视口有 60 的下限，可能贴到按钮顶边：点「复制内容」不能被正文跳转吃掉。
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    crate::agent_jump::intercept(true);
+    let mut h=H::new();
+    h.app.settings.dsh_notifications=true;
+    h.app.settings.agent.content=2;
+    h.app.settings.agent.expanded=true;
+    h.app.settings.agent.dwell=15;
+    let settings=h.app.settings.clone();
+    let finished=h.app.agent_cards.receive(serde_json::json!({
+        "id":"result-copy","provider":"dsh","kind":"finished",
+        "data":{"text":"短正文。","sessionId":"sess-copy","cwd":"C:\\work"}
+    }),&settings).expect("完成事件应转成通知");
+    h.app.agent_finished(finished.0,finished.1);
+    for _ in 0..60 {h.frame(vec![]);}
+    h.click_text("查看回复");
+    for _ in 0..45 {h.frame(vec![]);}
+    assert!(h.app.result_active());
+    let _=crate::agent_jump::take_feedback();
+    h.click_text("复制内容");
+    for _ in 0..8 {h.frame(vec![]);}
+    assert!(h.app.jump_note_text().is_none(),"点「复制内容」不能误触正文跳转");
+    crate::agent_jump::intercept(false);
+}
+
+#[test]
+fn result_layer_explanatory_text_is_not_a_jump_target(){
+    // 没有正文时结果层显示的是岛仔本机生成的解释，不是回复：点它不能触发跳转。
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    crate::agent_jump::intercept(true);
+    let mut h=H::new();
+    h.app.settings.dsh_notifications=true;
+    h.app.settings.agent.content=0;
+    h.app.settings.agent.expanded=true;
+    h.app.settings.agent.dwell=15;
+    let settings=h.app.settings.clone();
+    let finished=h.app.agent_cards.receive(serde_json::json!({
+        "id":"result-hint","provider":"dsh","kind":"finished",
+        "data":{"text":"","sessionId":"sess-hint","cwd":"C:\\work"}
+    }),&settings).expect("完成事件应转成通知");
+    h.app.agent_finished(finished.0,finished.1);
+    for _ in 0..60 {h.frame(vec![]);}
+    h.click_text("查看回复");
+    for _ in 0..45 {h.frame(vec![]);}
+    assert!(h.app.result_active(),"content=0 也应打开说明层");
+    let _=crate::agent_jump::take_feedback();
+    let line=h.strings().into_iter().find(|t|t.contains("完成内容")&&t.contains("宿主")).expect("说明层应有解释文字");
+    h.click_text(&line);
+    for _ in 0..10 {h.frame(vec![]);}
+    assert!(h.app.jump_note_text().is_none(),"说明层的解释文字不该触发跳转");
+    crate::agent_jump::intercept(false);
+}
+
+#[test]
 fn agent_badge_stays_after_completion_bubble_and_clears_when_opened(){
     // 需求：完成通知冒泡消失后，岛体侧边要像喝水/久坐一样常驻一个 Agent 角标；
     // 点它本身（或点「查看回复」）后角标才消失。

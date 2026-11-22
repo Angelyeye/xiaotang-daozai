@@ -245,6 +245,9 @@ pub(crate) struct ResultCard {
     pub text: String,
     /// 本机生成的说明（无正文时的占位），不是宿主正文。
     pub hint: bool,
+    /// 完成事件解析出的会话目标：点结果层正文可以回到原会话。
+    /// 打开时快照一份，避免之后又收到完成事件把 `done_jump` 覆盖成别的会话。
+    pub jump: Option<crate::agent_jump::Target>,
 }
 /// 收起卡（banner）的只读展示信息。
 pub(crate) struct BannerInfo {
@@ -544,14 +547,16 @@ impl Cards {
     }
     /// 完成通知「查看回复」：打开结果层（不落盘，只用事件带来的正文）。
     pub(crate) fn open_result(&mut self,provider:Provider,text:String){
-        self.result=Some(ResultCard{provider,text,hint:false});
+        // 正文层要能点回原会话：目标随结果层一起快照（完成事件解析出来的那个）。
+        self.result=Some(ResultCard{provider,text,hint:false,jump:self.done_jump.clone()});
         self.result_scroll=0.0;
         self.result_at=None;
     }
     /// 没有正文时的「查看回复」：打开本机说明层。
     /// 点击必须有可见结果——静默 no-op 会让用户以为按钮坏了。
     pub(crate) fn open_result_no_body(&mut self,provider:Provider){
-        self.result=Some(ResultCard{provider,text:NO_BODY_RESULT_TEXT.to_owned(),hint:true});
+        // 说明层里的字是岛仔本机生成的解释，不是回复正文：不挂跳转，避免伪装成可点的正文。
+        self.result=Some(ResultCard{provider,text:NO_BODY_RESULT_TEXT.to_owned(),hint:true,jump:None});
         self.result_scroll=0.0;
         self.result_at=None;
     }
@@ -560,7 +565,7 @@ impl Cards {
     pub(crate) fn result_size(&self)->(f32,f32){
         let Some(result)=&self.result else{return (agent_ui::CARD_W,140.0)};
         let Some(m)=self.measurer() else{return (agent_ui::CARD_W,140.0);};
-        let view=agent_ui::ResultView{provider:result.provider,kicker:result_kicker(result.hint),text:&result.text,scroll:self.result_scroll,age:1.0,copied:None,hint:result.hint};
+        let view=agent_ui::ResultView{provider:result.provider,kicker:result_kicker(result.hint),text:&result.text,scroll:self.result_scroll,age:1.0,copied:None,hint:result.hint,jump:result.jump.is_some()};
         agent_ui::measure_result(&m,&view)
     }
     pub(crate) fn draw_result(&mut self,c:&Card)->Option<Action>{
@@ -574,7 +579,7 @@ impl Cards {
         let age=(t-at).max(0.0) as f32;
         let copied=self.copied_at.map(|at|(1.4-at.elapsed().as_secs_f32()).max(0.0));
         if self.copied_at.is_some_and(|at|at.elapsed()>Duration::from_secs_f32(1.4)){self.copied_at=None;}
-        let view=agent_ui::ResultView{provider:result.provider,kicker:result_kicker(result.hint),text:&result.text,scroll:self.result_scroll,age,copied,hint:result.hint};
+        let view=agent_ui::ResultView{provider:result.provider,kicker:result_kicker(result.hint),text:&result.text,scroll:self.result_scroll,age,copied,hint:result.hint,jump:result.jump.is_some()};
         let (action,scroll)=agent_ui::draw_result(c,&m,&view,t);
         // 与审批/提问详情一致：滚动偏移必须写回状态，否则每帧都从 0 重新开始。
         self.result_scroll=scroll;
@@ -582,6 +587,10 @@ impl Cards {
             Some(Action::CopyResult)=>{
                 c.ui.ctx().copy_text(result.text.clone());
                 self.copied_at=Some(Instant::now());
+            }
+            Some(Action::Jump)=>{
+                // 点结果层正文回到原会话：结论由 agent_jump 反馈通道交给上层常驻显示。
+                if let Some(target)=result.jump.as_ref(){let _=crate::agent_jump::open(target);}
             }
             Some(Action::Dismiss)=>{self.close_result();}
             _=>{}
