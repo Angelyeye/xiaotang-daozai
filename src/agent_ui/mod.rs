@@ -135,6 +135,10 @@ pub(crate) struct ResultView<'a> {
     pub copied: Option<f32>,
     /// 本机生成的说明层（没有回复正文）：不提供「复制内容」，避免暗示这里有正文。
     pub hint: bool,
+    /// 有可跳转的客户端会话时，正文区域可点击回到原会话。
+    /// 结果层是「本轮回复」的完整正文，用户会自然地在这里点正文想回客户端；
+    /// 只给完成卡摘要挂跳转、这里不挂，等于把最主要的入口漏掉了。
+    pub jump: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -315,7 +319,7 @@ mod tests {
         let m = Measurer::new(&ctx);
         for repeat in [0usize, 3, 200] {
             let text = "## 标题\n- 条目\n\n段落文字。".repeat(repeat);
-            let view = ResultView { provider: crate::agent_notice::Provider::Dsh, kicker: "本轮回复", text: &text, scroll: 0.0, age: 1.0, copied: None, hint: false };
+            let view = ResultView { provider: crate::agent_notice::Provider::Dsh, kicker: "本轮回复", text: &text, scroll: 0.0, age: 1.0, copied: None, hint: false, jump: false };
             let (w, h) = measure_result(&m, &view);
             assert_eq!(w, CARD_W);
             assert!(h > 0.0 && h <= WIN_H);

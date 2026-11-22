@@ -718,6 +718,9 @@ pub(crate) fn draw_result(c: &Card, m: &M, v: &ResultView, t: f64) -> (Option<Ac
         "本机说明 · 不含回复内容"
     } else if v.copied.is_some() {
         "已复制到剪贴板"
+    } else if v.jump {
+        // 点正文能回客户端：这条提示让入口可见，否则「正文可点」没有任何线索。
+        "点正文回到会话 · 只读不落盘"
     } else {
         "可滚动阅读 · 只读，不落盘"
     };
@@ -737,12 +740,34 @@ pub(crate) fn draw_result(c: &Card, m: &M, v: &ResultView, t: f64) -> (Option<Ac
     };
     let (_, h) = measure_result(m, v);
     let view_h = (h - (body_top + 12.0 + BTN_H + FOOT_PAD)).max(60.0);
+    let footer_y = h - FOOT_PAD - BTN_H;
     let viewport = Viewport { top: body_top, height: view_h, content, offset: v.scroll };
     let scroll = viewport.wheel(&c, v.scroll, w);
     // 结果层外框 + 正文区矩形、滚动上限，供 E2E 断言「点关闭一次收起 / 滚动不翻页」。
     crate::ui_map::node("layer.result", c.rect(0.0, 0.0, w, h), v.kicker, true);
     crate::ui_map::node("body.result", c.rect(PAD, body_top, w - PAD * 2.0, view_h), "正文", true);
     crate::ui_map::publish_result_scroll(scroll, viewport.max_offset());
+    // 正文区整体可点击回到原会话：结果层就是「本轮回复」的完整正文，用户自然会在这里点正文
+    // 想回客户端。悬停给手型光标 + 极轻的整体提亮（画在文字下方，不影响阅读）。
+    // 高度收到底部按钮之上：正文极短时 view_h 有 60 的下限，会与 footer 顶边重叠几像素，
+    // 不能把那几像素也当成跳转区，否则点「复制内容」的上沿会误触。
+    let reply_h = view_h.min((footer_y - 2.0 - body_top).max(24.0));
+    let mut reply_hit = None;
+    if v.jump && !v.hint {
+        let r = c.hit(PAD - 6.0, body_top, w - PAD * 2.0 + 12.0, reply_h, "agent-result-body");
+        let (hover, _) = c.hover_t(&r);
+        crate::ui_map::node(
+            "body.reply",
+            c.rect(PAD - 6.0, body_top, w - PAD * 2.0 + 12.0, reply_h),
+            "回复正文（点击回到会话）",
+            true,
+        );
+        if hover > 0.01 {
+            c.fill(PAD - 6.0, body_top, w - PAD * 2.0 + 12.0, reply_h, 4.0, Color32::from_white_alpha((7.0 * hover) as u8));
+            c.ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        reply_hit = Some(r);
+    }
     let body = c.clipped(PAD - 6.0, body_top, w - PAD * 2.0 + 12.0, view_h).shifted(0.0, -scroll);
     let mut y = body_top;
     for (i, seg) in segs.iter().enumerate() {
@@ -802,13 +827,16 @@ pub(crate) fn draw_result(c: &Card, m: &M, v: &ResultView, t: f64) -> (Option<Ac
         y += seg_height(&c, seg);
     }
     viewport.bar(&c, w, 1.0);
-    let fy = h - FOOT_PAD - BTN_H;
+    let fy = footer_y;
     // 说明层没有正文可复制，只留「关闭」：有「复制内容」会让人以为正文只是没显示出来。
     let copy_close: &[(&str, &str, bool)] = &[("agent-result-copy", "复制内容", false), ("agent-result-close", "关闭", true)];
     let close_only: &[(&str, &str, bool)] = &[("agent-result-close", "关闭", true)];
     let specs = if v.hint { close_only } else { copy_close };
     if let Some(i) = widgets::draw_footer(&c, fy, w, specs, true) {
         action = Some(if v.hint || i == 1 { Action::Dismiss } else { Action::CopyResult });
+    }
+    if reply_hit.as_ref().is_some_and(|r| r.clicked()) {
+        action = Some(Action::Jump);
     }
     let _ = t;
     (action, scroll)
@@ -931,7 +959,7 @@ mod tests {
         let ctx = ctx();
         let m = M::new(&ctx);
         for text in ["", "普通一行", "## 标题\n- 条目\n\n```bash\nls\n```", "| a | b |\n| --- | --- |\n| 1 | 2 |"] {
-            let view = ResultView { provider: crate::agent_notice::Provider::Dsh, kicker: "本轮回复", text, scroll: 0.0, age: 1.0, copied: None, hint: false };
+            let view = ResultView { provider: crate::agent_notice::Provider::Dsh, kicker: "本轮回复", text, scroll: 0.0, age: 1.0, copied: None, hint: false, jump: false };
             let (w, h) = measure_result(&m, &view);
             assert_eq!(w, super::super::CARD_W);
             assert!(h > 0.0 && h <= WIN_H, "结果层高度必须留在画布内：{h}");

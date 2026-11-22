@@ -77,7 +77,7 @@
 | `btn.submit` | 提问 footer | 检查答案 / 提交回答 |
 | `btn.confirm` | 提问审阅页 | 确认提交 |
 | `btn.view` | 完成卡 | 查看回复 |
-| `body.reply` | 完成卡（有正文且有可跳转会话时） | 回复摘要区：点击回到 DSH/Codex 对应话题窗口（悬停提亮 + 手型光标） |
+| `body.reply` | 完成卡摘要 / 结果层正文（有正文且有可跳转会话时） | 点击回到 DSH/Codex 对应会话（悬停提亮/手型光标）；结果层的可点区域是正文视口 |
 | `btn.close` | 完成卡 footer / 结果层 footer | 关闭 |
 | `btn.dismiss` | 完成卡轻提示 | 轻提示上的关闭 |
 | `layer.result` | 结果层 | 结果层外框 |
